@@ -71,6 +71,8 @@ function restful_schema() {
  * Implements hook_uninstall().
  */
 function restful_uninstall() {
+  variable_del('restful_default_output_formatter');
+
   variable_del('restful_enable_discovery_resource');
 
   variable_del('restful_file_upload');
@@ -79,10 +81,13 @@ function restful_uninstall() {
   variable_del('restful_hijack_api_pages');
   variable_del('restful_hook_menu_base_path');
 
-  variable_del('restful_user_login_menu_item');
+  variable_del('restful_enable_user_login_resource');
 
   variable_del('restful_global_rate_limit');
   variable_del('restful_global_rate_period');
 
   variable_del('restful_enable_users_resource');
+
+  variable_del('restful_render_cache');
+  variable_del('restful_skip_basic_auth');
 }

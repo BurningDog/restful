@@ -68,6 +68,86 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
   protected $range = 50;
 
   /**
+   * Holds additional information about the generated values. This information
+   * is available to the formatters.
+   *
+   * @var array
+   */
+  protected $valueMetadata = array();
+
+  /**
+   * Determines the language of the items that should be returned.
+   *
+   * @var string
+   */
+  protected $langcode;
+
+  /**
+   * Static cache controller.
+   *
+   * @var \RestfulStaticCacheController
+   */
+  public $staticCache;
+
+  /**
+   * The public fields that are exposed to the API.
+   *
+   * @var array
+   */
+  protected $publicFields;
+
+  /**
+   * Get the cache id parameters based on the keys.
+   *
+   * @param $keys
+   *   Keys to turn into cache id parameters.
+   *
+   * @return array
+   *   The cache id parameters.
+   */
+  protected static function addCidParams($keys) {
+    $cid_params = array();
+    foreach ($keys as $param => $value) {
+      // Some request parameters don't affect how the resource is rendered, this
+      // means that we should skip them for the cache ID generation.
+      if (in_array($param, array(
+        '__application',
+        'filter',
+        'loadByFieldName',
+        'page',
+        'q',
+        'range',
+        'sort',
+      ))) {
+        continue;
+      }
+      // Make sure that ?fields=title,id and ?fields=id,title hit the same cache
+      // identifier.
+      $values = explode(',', $value);
+      sort($values);
+      $value = implode(',', $values);
+
+      $cid_params[] = substr($param, 0, 2) . ':' . $value;
+    }
+    return $cid_params;
+  }
+
+  /**
+   * Get value metadata.
+   *
+   * @param mixed $id
+   *   The resource item id.
+   * @param string $public_field_name
+   *   The public field name as in the output.
+   *
+   * @return array
+   *   An associative array containing extra metadata about the requested value.
+   */
+  public function getValueMetadata($id, $public_field_name) {
+    return isset($this->valueMetadata[$id][$public_field_name]) ? $this->valueMetadata[$id][$public_field_name] : NULL;
+  }
+
+  /**
    * Set the pager range.
    *
    * @param int $range
@@ -144,6 +224,53 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
    */
   public function getRequest() {
     return $this->request;
+  }
+
+  /**
+   * Gets a request array with the data that should be piped to sub requests.
+   *
+   * @return array
+   *   The request array to be piped.
+   */
+  protected function getRequestForSubRequest() {
+    $piped_request = array();
+
+    foreach ($this->getRequest() as $key => $value) {
+      if (in_array($key, array(
+          'filter',
+          'page',
+          'q',
+          'range',
+          'sort',
+          'fields',
+        ))) {
+        continue;
+      }
+
+      $piped_request[$key] = $value;
+    }
+
+    return $piped_request;
+  }
+
+
+  /**
+   * Get the language code.
+   *
+   * @return string
+   */
+  public function getLangCode() {
+    return $this->langcode;
+  }
+
+  /**
+   * Sets the language code.
+   *
+   * @param string $langcode
+   *   The language code.
+   */
+  public function setLangCode($langcode) {
+    $this->langcode = $langcode;
   }
 
   /**
@@ -226,6 +353,21 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
   }
 
   /**
+   * {@inheritdoc}
+   */
+  public function addHttpHeaders($key, $value) {
+    $headers = $this->getHttpHeaders();
+    // Add a value to the (potentially) existing header.
+    $values = array();
+    if (!empty($headers[$key])) {
+      $values[] = $headers[$key];
+    }
+    $values[] = $value;
+    $header = implode(', ', $values);
+    $this->setHttpHeaders($key, $header);
+  }
+
+  /**
    * Setter for $authenticationManager.
    *
    * @param \RestfulAuthenticationManager $authenticationManager
@@ -263,7 +405,7 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
 
   /**
    * Getter for rateLimitManager.
-
+   *
    * @return \RestfulRateLimitManager
    */
   public function getRateLimitManager() {
@@ -280,12 +422,20 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
    * @param DrupalCacheInterface $cache_controller
    *   (optional) Injected cache backend.
    */
-  public function __construct(array $plugin, \RestfulAuthenticationManager $auth_manager = NULL, \DrupalCacheInterface $cache_controller = NULL) {
+  public function __construct(array $plugin, \RestfulAuthenticationManager $auth_manager = NULL, \DrupalCacheInterface $cache_controller = NULL, $langcode = NULL) {
     parent::__construct($plugin);
     $this->authenticationManager = $auth_manager ? $auth_manager : new \RestfulAuthenticationManager();
     $this->cacheController = $cache_controller ? $cache_controller : $this->newCacheObject();
     if ($rate_limit = $this->getPluginKey('rate_limit')) {
       $this->setRateLimitManager(new \RestfulRateLimitManager($this->getPluginKey('resource'), $rate_limit));
+    }
+    $this->staticCache = new \RestfulStaticCacheController();
+    if (is_null($langcode)) {
+      global $language;
+      $this->langcode = $language->language;
+    }
+    else {
+      $this->langcode = $langcode;
     }
   }
 
@@ -390,8 +540,17 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
    *   The formatted output.
    */
   public function format(array $data) {
-    $formatter_handler = restful_output_format($this);
-    return $formatter_handler->format($data);
+    return $this->formatter()->format($data);
+  }
+
+  /**
+   * Get the formatter handler for the current restful formatter.
+   *
+   * @return \RestfulFormatterInterface
+   *   The formatter handler.
+   */
+  protected function formatter() {
+    return \RestfulManager::outputFormat($this);
   }
 
   /**
@@ -447,10 +606,16 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
    *   definition.
    */
   public function getVersion() {
-    return array(
+    $version = $this->staticCache->get(__CLASS__ . '::' . __FUNCTION__);
+    if (isset($version)) {
+      return $version;
+    }
+    $version = array(
       'major' => $this->getPluginKey('major_version'),
       'minor' => $this->getPluginKey('minor_version'),
     );
+    $this->staticCache->set(__CLASS__ . '::' . __FUNCTION__, $version);
+    return $version;
   }
 
   /**
@@ -560,6 +725,8 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
    */
   public function options($path = '', array $request = array()) {
     $this->setMethod(\RestfulInterface::OPTIONS);
+    $this->setPath($path);
+    $this->setRequest($request);
     // A list of discoverable methods.
     $allowed_methods = array();
     foreach ($this->getControllers() as $pattern => $controllers) {
@@ -629,6 +796,13 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
     $this->setMethod($method);
     $this->setPath($path);
     $this->setRequest($request);
+
+    // Clear all static caches from previous requests.
+    $this->staticCache->clearAll();
+
+    // Override the range with the value in the URL.
+    $this->overrideRange();
+
     $version = $this->getVersion();
     $this->setHttpHeaders('X-API-Version', 'v' . $version['major']  . '.' . $version['minor']);
 
@@ -641,7 +815,16 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
       $this->getRateLimitManager()->checkRateLimit($request);
     }
 
-    return $this->{$method_name}($path);
+    $return = $this->{$method_name}($path);
+
+    if (empty($request['__application']['rest_call'])) {
+      // Switch back to the original user.
+      $this->getAuthenticationManager()->switchUserBack();
+    }
+
+
+    return $return;
+
   }
 
   /**
@@ -734,10 +917,15 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
     $request = $this->getRequest();
     $public_fields = $this->getPublicFields();
 
-    $sorts = array();
     if (empty($request['sort'])) {
       return array();
     }
+    $url_params = $this->getPluginKey('url_params');
+    if (!$url_params['sort']) {
+      throw new \RestfulBadRequestException('Sort parameters have been disabled in server configuration.');
+    }
+
+    $sorts = array();
     foreach (explode(',', $request['sort']) as $sort) {
       $direction = $sort[0] == '-' ? 'DESC' : 'ASC';
       $sort = str_replace('-', '', $sort);
@@ -795,6 +983,10 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
       // No filtering is needed.
       return array();
     }
+    $url_params = $this->getPluginKey('url_params');
+    if (!$url_params['filter']) {
+      throw new \RestfulBadRequestException('Filter parameters have been disabled in server configuration.');
+    }
 
     $filters = array();
     $public_fields = $this->getPublicFields();
@@ -804,21 +996,45 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
         throw new RestfulBadRequestException(format_string('The filter @filter is not allowed for this path.', array('@filter' => $public_field)));
       }
 
+      // Filtering can be achieved in different ways:
+      //   1. filter[foo]=bar
+      //   2. filter[foo][0]=bar&filter[foo][1]=baz
+      //   3. filter[foo][value]=bar
+      //   4. filter[foo][value][0]=bar&filter[foo][value][1]=baz
       if (!is_array($value)) {
         // Request uses the shorthand form for filter. For example
         // filter[foo]=bar would be converted to filter[foo][value] = bar.
         $value = array('value' => $value);
       }
+      if (!is_array($value['value'])) {
+        $value['value'] = array($value['value']);
+      }
       // Add the property
       $value['public_field'] = $public_field;
+
+      // Set default operator count as `1` when value is empty.
+      // When PHP < 5.6 and the passed value is an empty array we get:
+      // `array_fill(): Number of elements must be positive` exception.
+      $default_operator_count = count($value['value']) ? count($value['value']) : 1;
       // Set default operator.
-      $value += array('operator' => '=');
+      $value += array('operator' => array_fill(0, $default_operator_count, '='));
+      if (!is_array($value['operator'])) {
+        $value['operator'] = array($value['operator']);
+      }
+
+      // Make sure that we have the same amount of operators than values.
+      if (!in_array(strtoupper($value['operator'][0]), array('IN', 'NOT IN', 'BETWEEN')) && count($value['value']) != count($value['operator'])) {
+        throw new RestfulBadRequestException('The number of operators and values has to be the same.');
+      }
+
+      $value += array('conjunction' => 'AND');
 
       // Clean the operator in case it came from the URL.
       // e.g. filter[minor_version][operator]=">="
       $value['operator'] = str_replace(array('"', "'"), '', $value['operator']);
 
-      $this->isValidOperatorForFilter($value['operator']);
+      static::isValidOperatorsForFilter($value['operator']);
+      static::isValidConjunctionForFilter($value['conjunction']);
 
       $filters[] = $value;
     }
@@ -829,12 +1045,12 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
   /**
    * Check if an operator is valid for filtering.
    *
-   * @param string $operator
-   *   The operator.
+   * @param array $operators
+   *   The array of operators.
    *
    * @throws RestfulBadRequestException
    */
-  protected function isValidOperatorForFilter($operator) {
+  protected static function isValidOperatorsForFilter(array $operators) {
     $allowed_operators = array(
       '=',
       '>',
@@ -843,14 +1059,42 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
       '<=',
       '<>',
       '!=',
-      'IN',
       'BETWEEN',
+      'CONTAINS',
+      'IN',
+      'NOT IN',
+      'STARTS_WITH',
     );
 
-    if (!in_array($operator, $allowed_operators)) {
-      throw new \RestfulBadRequestException(format_string('Operator "@operator" is not allowed for filtering on this resource. Allowed operators are: !allowed', array(
-        '@operator' => $operator,
-        '!allowed' => implode(', ', $allowed_operators),
+    foreach ($operators as $operator) {
+      if (!in_array($operator, $allowed_operators)) {
+        throw new \RestfulBadRequestException(format_string('Operator "@operator" is not allowed for filtering on this resource. Allowed operators are: !allowed', array(
+          '@operator' => $operator,
+          '!allowed' => implode(', ', $allowed_operators),
+        )));
+      }
+    }
+  }
+
+  /**
+   * Check if a conjunction is valid for filtering.
+   *
+   * @param string $conjunction
+   *   The operator.
+   *
+   * @throws RestfulBadRequestException
+   */
+  protected static function isValidConjunctionForFilter($conjunction) {
+    $allowed_conjunctions = array(
+      'AND',
+      'OR',
+      'XOR',
+    );
+
+    if (!in_array(strtoupper($conjunction), $allowed_conjunctions)) {
+      throw new \RestfulBadRequestException(format_string('Conjunction "@conjunction" is not allowed for filtering on this resource. Allowed conjunctions are: !allowed', array(
+        '@conjunction' => $conjunction,
+        '!allowed' => implode(', ', $allowed_conjunctions),
       )));
     }
   }
@@ -859,7 +1103,39 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
    * {@inheritdoc}
    */
   public function getPublicFields() {
+    if ($this->publicFields) {
+      // Return early.
+      return $this->publicFields;
+    }
+
     $public_fields = $this->publicFieldsInfo();
+
+    // Cache the processed fields.
+    $this->setPublicFields($public_fields);
+
+    return $this->publicFields;
+  }
+
+  /**
+   * Set the public fields.
+   *
+   * @param array $public_fields
+   *   The unprocessed public fields array.
+   */
+  public function setPublicFields(array $public_fields = array()) {
+    $this->publicFields = $this->addDefaultValuesToPublicFields($public_fields);
+  }
+
+  /**
+   * Add default values to the public fields array.
+   *
+   * @param array $public_fields
+   *   The unprocessed public fields array.
+   *
+   * @return array
+   *   The processed public fields array.
+   */
+  protected function addDefaultValuesToPublicFields(array $public_fields = array()) {
     // Set defaults values.
     foreach (array_keys($public_fields) as $key) {
       // Set default values.
@@ -867,8 +1143,10 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
       $info += array(
         'process_callbacks' => array(),
         'callback' => FALSE,
+        'create_or_update_passthrough' => FALSE,
       );
     }
+
     return $public_fields;
   }
 
@@ -988,7 +1266,7 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
   }
 
   /**
-   * Get a rendered entity from cache.
+   * Get an entry from the rendered cache.
    *
    * @param array $context
    *   An associative array with additional information to build the cache ID.
@@ -1010,7 +1288,7 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
   }
 
   /**
-   * Store a rendered entity into the cache.
+   * Store an entry in the rendered cache.
    *
    * @param mixed $data
    *   The data to be stored into the cache generated by
@@ -1034,7 +1312,37 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
   }
 
   /**
-   * Generate a cache identifier for the request and the current entity.
+   * Clear an entry from the rendered cache.
+   *
+   * @param array $context
+   *   An associative array with additional information to build the cache ID.
+   *
+   * @see \RestfulEntityInterface::viewEntity().
+   */
+  protected function clearRenderedCache(array $context = array()) {
+    $cache_info = $this->getPluginKey('render_cache');
+    if (!$cache_info['render']) {
+      return;
+    }
+
+    $cid = $this->generateCacheId($context);
+    return $this->getCacheController()->clear($cid);
+  }
+
+  /**
+   * Clear all caches corresponding to the current resource.
+   */
+  public function clearResourceRenderedCache() {
+    // Build the cache ID.
+    $version = $this->getVersion();
+    $cid = 'v' . $version['major'] . '.' . $version['minor'] . '::' . $this->getResourceName();
+    $this->cacheInvalidate($cid);
+  }
+
+  /**
+   * Generate a cache identifier for the request and the current context.
+   *
+   * This cache ID may be used by all RestfulDataProviderInterface.
    *
    * @param array $context
    *   An associative array with additional information to build the cache ID.
@@ -1043,46 +1351,56 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
    *   The cache identifier.
    */
   protected function generateCacheId(array $context = array()) {
-    // Get the cache ID from the selected params. We will use a complex cache ID
-    // for smarter invalidation. The cache id will be like:
-    // v<major version>.<minor version>::uu<user uid>::pa<params array>
-    // The code before every bit is a 2 letter representation of the label. For
-    // instance, the params array will be something like:
-    // fi:id,title::re:admin
-    // When the request has ?fields=id,title&restrict=admin
-    $version = $this->getVersion();
-    $cid = 'v' . $version['major'] . '.' . $version['minor'] . '::uu' . $this->getAccount()->uid . '::pa';
-    $cid_params = array();
-    $request = $this->getRequest();
-    static::cleanRequest($request);
-    $options = $context + $request;
-    foreach ($options as $param => $value) {
-      // Some request parameters don't affect how the resource is rendered, this
-      // means that we should skip them for the cache ID generation.
-      if (in_array($param, array('page', 'sort', 'q', '__application', 'filter'))) {
-        continue;
+    // For performance reasons create the request part and cache it, then add
+    // the context part.
+    $base_cid = $this->staticCache->get(__CLASS__ . '::' . __FUNCTION__);
+    if (!isset($base_cid)) {
+      // Get the cache ID from the selected params. We will use a complex cache
+      // ID for smarter invalidation. The cache id will be like:
+      // v<major version>.<minor version>::uu<user uid>::pa<params array>
+      // The code before every bit is a 2 letter representation of the label.
+      // For instance, the params array will be something like:
+      // fi:id,title::re:admin
+      // When the request has ?fields=id,title&restrict=admin
+      $version = $this->getVersion();
+      $account = $this->getAccount();
+      $cache_info = $this->getPluginKey('render_cache');
+      if ($cache_info['granularity'] == DRUPAL_CACHE_PER_USER) {
+        $account_cid = '::uu' . $account->uid;
       }
-      // Make sure that ?fields=title,id and ?fields=id,title hit the same cache
-      // identifier.
-      $values = explode(',', $value);
-      sort($values);
-      $value = implode(',', $values);
-
-      $cid_params[] = substr($param, 0, 2) . ':' . $value;
+      elseif ($cache_info['granularity'] == DRUPAL_CACHE_PER_ROLE) {
+        // Instead of encoding the user ID in the cache ID add the role ids.
+        $account_cid = '::ur' . implode(',', array_keys($account->roles));
+      }
+      else {
+        throw new \RestfulNotImplementedException(format_string('The selected cache granularity (@granularity) is not supported.', array(
+          '@granularity' => $cache_info['granularity'],
+        )));
+      }
+      $base_cid = 'v' . $version['major'] . '.' . $version['minor'] . '::' . $this->getResourceName() . $account_cid . '::pa';
+      $this->staticCache->set(__CLASS__ . '::' . __FUNCTION__, $base_cid);
     }
-    $cid .= implode('::', $cid_params);
-    return $cid;
+    // Now add the context part to the cid
+    $cid_params = static::addCidParams($context);
+    if ($this->isReadMethod($this->getMethod())) {
+      // We don't want to split the cache with the body data on write requests.
+      $request = $this->getRequest();
+      static::cleanRequest($request);
+      $cid_params = array_merge($cid_params, static::addCidParams($request));
+    }
+
+    return $base_cid . implode('::', $cid_params);
   }
 
   /**
    * Invalidates cache for a certain entity.
    *
    * @param string $cid
-   *   The wildcard cache id to invalidate.
+   *   The wildcard cache id to invalidate. Do not add * for the wildcard.
    */
   public function cacheInvalidate($cid) {
     $cache_info = $this->getPluginKey('render_cache');
-    if (!$cache_info['simple_invalidate']) {
+    if (!$cache_info['render'] || !$cache_info['simple_invalidate']) {
       // Simple invalidation is disabled. This means it is up to the
       // implementing module to take care of the invalidation.
       return;
@@ -1128,7 +1446,7 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
   protected function accessByAllowOrigin() {
     // Check the referrer header and return false if it does not match the
     // Access-Control-Allow-Origin
-    $referer = empty($_SERVER['HTTP_REFERER']) ? '' : $_SERVER['HTTP_REFERER'];
+    $referer = \RestfulManager::getRequestHttpHeader('Referer', '');
     // If there is no allow_origin assume that it is allowed. Also, if there is
     // no referer then grant access since the request probably was not
     // originated from a browser.
@@ -1194,10 +1512,11 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
       return $version;
     }
     // If there is no version in the URL check the header.
-    if (!empty($_SERVER['HTTP_X_API_VERSION'])) {
-      $version =  static::parseVersionString($_SERVER['HTTP_X_API_VERSION'], $resource_name);
+    if ($api_version = \RestfulManager::getRequestHttpHeader('X-API-Version')) {
+      $version =  static::parseVersionString($api_version, $resource_name);
       return $version;
     }
+
     // If there is no version negotiation information return the latest version.
     $version = static::getResourceLastVersion($resource_name);
     return $version;
@@ -1210,13 +1529,15 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
    *   The path for the resource
    * @param array $options
    *   Array of options as in url().
+   * @param boolean $version_string
+   *   TRUE to add the version string to the URL. FALSE otherwise.
    *
    * @return string
    *   The fully qualified URL.
    *
    * @see url().
    */
-  public function versionedUrl($path = '', $options = array()) {
+  public function versionedUrl($path = '', $options = array(), $version_string = TRUE) {
     // Make the URL absolute by default.
     $options += array('absolute' => TRUE);
     $plugin = $this->getPlugin();
@@ -1226,7 +1547,11 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
     }
 
     $base_path = variable_get('restful_hook_menu_base_path', 'api');
-    $url = $base_path . '/v' . $plugin['major_version'] . '.' . $plugin['minor_version'] . '/' . $plugin['resource'] . '/' . $path;
+    $url = $base_path;
+    if ($version_string) {
+      $url .= '/v' . $plugin['major_version'] . '.' . $plugin['minor_version'];
+    }
+    $url .= '/' . $plugin['resource'] . '/' . $path;
     return url(rtrim($url, '/'), $options);
   }
 
@@ -1390,6 +1715,47 @@ abstract class RestfulBase extends \RestfulPluginBase implements \RestfulInterfa
   protected static function notImplementedCrudOperation($operation) {
     // The default behavior is to not support the crud action.
     throw new \RestfulNotImplementedException(format_string('The "@method" method is not implemented in class @class.', array('@method' => $operation, '@class' => __CLASS__)));
+  }
+
+  /**
+   * Overrides the range parameter with the URL value if any.
+   *
+   * @throws RestfulBadRequestException
+   */
+  protected function overrideRange() {
+    $request = $this->getRequest();
+    if (!empty($request['range'])) {
+      $url_params = $this->getPluginKey('url_params');
+      if (!$url_params['range']) {
+        throw new \RestfulBadRequestException('The range parameter has been disabled in server configuration.');
+      }
+
+      if (!ctype_digit((string) $request['range']) || $request['range'] < 1) {
+        throw new \RestfulBadRequestException('"Range" property should be numeric and higher than 0.');
+      }
+      if ($request['range'] < $this->getRange()) {
+        // If there is a valid range property in the request override the range.
+        $this->setRange($request['range']);
+      }
+    }
+  }
+
+  /**
+   * Helper method to determine if an array is numeric.
+   *
+   * @param array $input
+   *   The input array.
+   *
+   * @return boolean
+   *   TRUE if the array is numeric, false otherwise.
+   */
+  public final static function isArrayNumeric(array $input) {
+    foreach (array_keys($input) as $key) {
+      if (!ctype_digit((string) $key)) {
+        return FALSE;
+      }
+    }
+    return TRUE;
   }
 
 }

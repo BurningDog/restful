@@ -17,6 +17,44 @@ function restful_test_ctools_plugin_directory($module, $plugin) {
 /**
  * Flag a field to not be accessible.
  *
+ * @param $nid
+ *   The node ID to deny access.
+ */
+function restful_test_deny_access_node($nid) {
+  variable_set('restful_test_deny_access_node', $nid);
+}
+
+/**
+ * Clear un-accessible node.
+ */
+function restful_test_clear_access_node() {
+  variable_del('restful_test_deny_access_node');
+}
+
+/**
+ * Implements hook_node_access().
+ */
+function restful_test_node_access($node, $op, $account) {
+  if (!$nid = variable_get('restful_test_deny_access_node')) {
+    return;
+  }
+
+  if ($op != 'view') {
+    return;
+  }
+
+  if ($node->nid != $nid) {
+    return;
+  }
+
+  // Deny access.
+  return NODE_ACCESS_DENY;
+}
+
+
+/**
+ * Flag a field to not be accessible.
+ *
  * @param $field_name
  *   The field name. Defaults to "body".
  */
@@ -27,7 +65,7 @@ function restful_test_deny_access_field($field_name = 'body') {
 /**
  * Clear un-accessible fields.
  */
-function restful_test_clear_access() {
+function restful_test_clear_access_field() {
   variable_del('restful_test_deny_access_field');
 }
 
@@ -45,22 +83,30 @@ function restful_test_field_access($op, $field, $entity_type, $entity, $account)
 }
 
 /**
- * Helper function to add common fields to the entity test's "main" bundle.
+ * Helper function to add common fields.
+ *
+ * @param string $entity_type
+ *   The entity type. Defautls to "entity_test".
+ * @param string $bundle.
+ *   The bundle name. Defaults to "main".
+ *
+ * @return int
+ *   The vocabulary ID created.
  */
-function restful_test_add_fields() {
+function restful_test_add_fields($entity_type = 'entity_test', $bundle = 'main') {
   // Text - single.
   $field = array(
     'field_name' => 'text_single',
     'type' => 'text_long',
-    'entity_types' => array('entity_test'),
+    'entity_types' => array($entity_type),
     'cardinality' => 1,
   );
   field_create_field($field);
 
   $instance = array(
     'field_name' => 'text_single',
-    'bundle' => 'main',
-    'entity_type' => 'entity_test',
+    'bundle' => $bundle,
+    'entity_type' => $entity_type,
     'label' => t('Text single'),
     'settings' => array(
       // No text processing
@@ -73,15 +119,15 @@ function restful_test_add_fields() {
   $field = array(
     'field_name' => 'text_single_processing',
     'type' => 'text_long',
-    'entity_types' => array('entity_test'),
+    'entity_types' => array($entity_type),
     'cardinality' => 1,
   );
   field_create_field($field);
 
   $instance = array(
     'field_name' => 'text_single_processing',
-    'bundle' => 'main',
-    'entity_type' => 'entity_test',
+    'bundle' => $bundle,
+    'entity_type' => $entity_type,
     'label' => t('Text single with text processing'),
     'settings' => array(
       'text_processing' => 1,
@@ -93,15 +139,15 @@ function restful_test_add_fields() {
   $field = array(
     'field_name' => 'text_multiple',
     'type' => 'text_long',
-    'entity_types' => array('entity_test'),
+    'entity_types' => array($entity_type),
     'cardinality' => FIELD_CARDINALITY_UNLIMITED,
   );
   field_create_field($field);
 
   $instance = array(
     'field_name' => 'text_multiple',
-    'bundle' => 'main',
-    'entity_type' => 'entity_test',
+    'bundle' => $bundle,
+    'entity_type' => $entity_type,
     'label' => t('Text multiple'),
     'settings' => array(
       'text_processing' => 0,
@@ -113,15 +159,15 @@ function restful_test_add_fields() {
   $field = array(
     'field_name' => 'text_multiple_processing',
     'type' => 'text_long',
-    'entity_types' => array('entity_test'),
+    'entity_types' => array($entity_type),
     'cardinality' => FIELD_CARDINALITY_UNLIMITED,
   );
   field_create_field($field);
 
   $instance = array(
     'field_name' => 'text_multiple_processing',
-    'bundle' => 'main',
-    'entity_type' => 'entity_test',
+    'bundle' => $bundle,
+    'entity_type' => $entity_type,
     'label' => t('Text multiple with text processing'),
     'settings' => array(
       'text_processing' => 1,
@@ -131,10 +177,10 @@ function restful_test_add_fields() {
 
   // Entity reference - single.
   $field = array(
-    'entity_types' => array('entity_test'),
+    'entity_types' => array($entity_type),
     'settings' => array(
       'handler' => 'base',
-      'target_type' => 'entity_test',
+      'target_type' => $entity_type,
       'handler_settings' => array(
       ),
     ),
@@ -145,9 +191,9 @@ function restful_test_add_fields() {
   field_create_field($field);
 
   $instance = array(
-    'entity_type' => 'entity_test',
+    'entity_type' => $entity_type,
     'field_name' => 'entity_reference_single',
-    'bundle' => 'main',
+    'bundle' => $bundle,
     'label' => t('Entity reference single'),
   );
 
@@ -155,10 +201,10 @@ function restful_test_add_fields() {
 
   // Entity reference - multiple.
   $field = array(
-    'entity_types' => array('entity_test'),
+    'entity_types' => array($entity_type),
     'settings' => array(
       'handler' => 'base',
-      'target_type' => 'entity_test',
+      'target_type' => $entity_type,
       'handler_settings' => array(
       ),
     ),
@@ -169,9 +215,9 @@ function restful_test_add_fields() {
   field_create_field($field);
 
   $instance = array(
-    'entity_type' => 'entity_test',
+    'entity_type' => $entity_type,
     'field_name' => 'entity_reference_multiple',
-    'bundle' => 'main',
+    'bundle' => $bundle,
     'label' => t('Entity reference multiple'),
   );
 
@@ -183,15 +229,15 @@ function restful_test_add_fields() {
   $field = array(
     'field_name' => 'term_single',
     'type' => 'taxonomy_term_reference',
-    'entity_types' => array('entity_test'),
+    'entity_types' => array($entity_type),
     'cardinality' => 1,
   );
   field_create_field($field);
 
   $instance = array(
     'field_name' => 'term_single',
-    'bundle' => 'main',
-    'entity_type' => 'entity_test',
+    'bundle' => $bundle,
+    'entity_type' => $entity_type,
     'label' => t('Term reference single'),
     'settings' => array(
       'settings' => array(
@@ -209,15 +255,15 @@ function restful_test_add_fields() {
   $field = array(
     'field_name' => 'term_multiple',
     'type' => 'taxonomy_term_reference',
-    'entity_types' => array('entity_test'),
+    'entity_types' => array($entity_type),
     'cardinality' => FIELD_CARDINALITY_UNLIMITED,
   );
   field_create_field($field);
 
   $instance = array(
     'field_name' => 'term_multiple',
-    'bundle' => 'main',
-    'entity_type' => 'entity_test',
+    'bundle' => $bundle,
+    'entity_type' => $entity_type,
     'label' => t('Term reference multiple'),
     'settings' => array(
       'settings' => array(
@@ -242,9 +288,9 @@ function restful_test_add_fields() {
 
   $instance = array(
     'field_name' => 'file_single',
-    'entity_type' => 'entity_test',
+    'entity_type' => $entity_type,
     'label' => 'File single',
-    'bundle' => 'main',
+    'bundle' => $bundle,
   );
   field_create_instance($instance);
 
@@ -259,9 +305,9 @@ function restful_test_add_fields() {
 
   $instance = array(
     'field_name' => 'file_multiple',
-    'entity_type' => 'entity_test',
+    'entity_type' => $entity_type,
     'label' => 'File multiple',
-    'bundle' => 'main',
+    'bundle' => $bundle,
   );
   field_create_instance($instance);
 
@@ -276,9 +322,9 @@ function restful_test_add_fields() {
 
   $instance = array(
     'field_name' => 'image_single',
-    'entity_type' => 'entity_test',
+    'entity_type' => $entity_type,
     'label' => 'Image single',
-    'bundle' => 'main',
+    'bundle' => $bundle,
   );
   field_create_instance($instance);
 
@@ -293,11 +339,13 @@ function restful_test_add_fields() {
 
   $instance = array(
     'field_name' => 'image_multiple',
-    'entity_type' => 'entity_test',
+    'entity_type' => $entity_type,
     'label' => 'Image multiple',
-    'bundle' => 'main',
+    'bundle' => $bundle,
   );
   field_create_instance($instance);
+
+  return $vocabulary_id;
 }
 
 
@@ -343,45 +391,65 @@ function restful_test_create_vocabulary_and_terms($machine_name = 'test_vocab', 
 }
 
 /**
- * Instead of implementing hook_schema use this helper function.
+ * Helper function; Create a node with taxonomy terms.
  *
- * In order to not to delay all tests using the test module. Only create the
- * table when necessary.
- *
- * @return array
- *   A Schema API definition.
+ * @return object
+ *   The saved node.
  */
-function _restful_test_schema() {
-  $schema['restful_test_db_query'] = array(
+function restful_test_create_node_with_tags() {
+  $values = array('type' => 'article');
+  $node = entity_create('node', $values);
 
-    'description' => 'Table for DbQuery testing.',
-    'fields' => array(
-      'id' => array(
-        'description' => 'The primary identifier for a record.',
-        'type' => 'serial',
-        'unsigned' => TRUE,
-        'not null' => TRUE,
+  $vocabulary = taxonomy_vocabulary_machine_name_load('tags');
+
+  // Create a random number of tags for the created node.
+  for ($index = 0; $index < mt_rand(1, 10); $index++) {
+    $term = (object) array(
+      'vid' => $vocabulary->vid,
+      'name' => 'term ' . $vocabulary->vid . '::' . $index,
+    );
+    taxonomy_term_save($term);
+    $terms[] = $term;
+    $node->field_tags[LANGUAGE_NONE][$index]['tid'] = $term->tid;
+  }
+  node_save($node);
+
+  return $node;
+}
+
+/**
+ * Implements hook_entity_info().
+ */
+function restful_test_entity_info() {
+  return array(
+    'restful_test_translatable_entity' => array(
+      'label' => t('Translatable Test Entity'),
+      'plural label' => t('Translatable Test Entities'),
+      'description' => t('An entity type used by the Restful tests.'),
+      'entity class' => 'Entity',
+      'controller class' => 'EntityAPIController',
+      'base table' => 'restful_test_translatable_entity',
+      'fieldable' => TRUE,
+      'entity keys' => array(
+        'id' => 'pid',
+        'bundle' => 'name',
+        'label' => 'label',
       ),
-      'str_field' => array(
-        'description' => 'String piece of data.',
-        'type' => 'varchar',
-        'length' => 32,
-        'not null' => TRUE,
-        'default' => '',
+      // Make use the class' label() and uri() implementation by default.
+      'label callback' => 'entity_class_label',
+      'uri callback' => 'entity_class_uri',
+      'bundles' => array(
+        'restful_test_translatable_entity' => array(
+          'label' => 'Translatable Test Entity'
+        )
       ),
-      'int_field' => array(
-        'description' => 'An int piece of data.',
-        'type' => 'int',
-        'not null' => TRUE,
-        'default' => 0,
+      'bundle keys' => array(
+        'bundle' => 'name',
       ),
-      'serialized_field' => array(
-        'description' => 'An serialized piece of data.',
-        'type' => 'blob',
-        'serialize' => TRUE,
+      'module' => 'restful_test',
+      'translation' => array(
+        'locale' => TRUE,
       ),
     ),
-    'primary key' => array('id'),
   );
-  return $schema;
 }

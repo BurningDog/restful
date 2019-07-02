@@ -27,8 +27,8 @@ class RestfulEntityBaseMultipleBundles extends RestfulEntityBase {
     );
   }
 
-  public function __construct(array $plugin, \RestfulAuthenticationManager $auth_manager = NULL, \DrupalCacheInterface $cache_controller = NULL) {
-    parent::__construct($plugin);
+  public function __construct(array $plugin, \RestfulAuthenticationManager $auth_manager = NULL, \DrupalCacheInterface $cache_controller = NULL, $language = NULL) {
+    parent::__construct($plugin, $auth_manager, $cache_controller, $language);
 
     if (!empty($plugin['bundles'])) {
       $this->bundles = $plugin['bundles'];
@@ -83,7 +83,9 @@ class RestfulEntityBaseMultipleBundles extends RestfulEntityBase {
       }
 
       $bundle_handler = $handlers[$bundle];
-      $return[] = $bundle_handler->viewEntity($id, $request, $account);
+      $bundle_handler->setAccount($account);
+      $bundle_handler->setRequest($request);
+      $return[] = $bundle_handler->viewEntity($id);
     }
 
     return $return;

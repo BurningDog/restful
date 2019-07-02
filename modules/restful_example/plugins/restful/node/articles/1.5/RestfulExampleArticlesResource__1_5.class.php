@@ -45,6 +45,23 @@ class RestfulExampleArticlesResource__1_5 extends RestfulEntityBaseNode {
       );
     }
 
+    $public_fields['user'] = array(
+      'property' => 'author',
+      'resource' => array(
+        // The bundle of the entity.
+        'user' => array(
+          // The name of the resource to map to.
+          'name' => 'users',
+          // Determines if the entire resource should appear, or only the ID.
+          'full_view' => TRUE,
+        ),
+      ),
+    );
+
+    $public_fields['static'] = array(
+      'callback' => 'static::randomNumber',
+    );
+
     return $public_fields;
   }
 
@@ -75,4 +92,18 @@ class RestfulExampleArticlesResource__1_5 extends RestfulEntityBaseNode {
       'styles' => $value['image_styles'],
     );
   }
+
+  /**
+   * Callback, Generate a random number.
+   *
+   * @param \EntityMetadataWrapper $wrapper
+   *   The EMW.
+   *
+   * @return int
+   *   A random integer.
+   */
+  public static function randomNumber($wrapper) {
+    return mt_rand();
+  }
+
 }

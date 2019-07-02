@@ -1,20 +1,17 @@
 /**
  * restful-app
- * @version v0.0.1 - 2014-07-24
- * @link
+ * @version v0.0.1 - 2015-10-29
+ * @link 
  * @author  <>
  * @license MIT License, http://www.opensource.org/licenses/MIT
  */
 'use strict';
 
-angular.module('restfulApp', [
-    'angularFileUpload',
-    'ngPrettyJson',
-    'ui.select2'
-  ], function($httpProvider) {
+var app = angular.module('restfulApp', restfulExampleModules, function($httpProvider) {
 
     // Use x-www-form-urlencoded Content-Type
     $httpProvider.defaults.headers.post['Content-Type'] = 'application/x-www-form-urlencoded;charset=utf-8';
+    $httpProvider.defaults.headers.common['X-API-Version'] = 'v1.5';
 
     /**
      * The workhorse; converts an object to x-www-form-urlencoded serialization.
@@ -57,15 +54,86 @@ angular.module('restfulApp', [
       var result = angular.isObject(data) && String(data) !== '[object File]' ? param(data) : data;
       return result;
     }];
-});
+  });
+
+if (restfulExampleModules.indexOf('ng-admin') !== -1) {
+  // This configuration is specific for ng-admin. Do not add it for other
+  // examples.
+  app.config(function (NgAdminConfigurationProvider, Application, Entity, Field, Reference, ReferencedList, ReferenceMany) {
+    // set the main API endpoint for this admin
+    var app = new Application('RESTful Admin')
+      .baseApiUrl(Drupal.settings.restfulExample.apiPath);
+
+    // define an entity mapped by the http://<hostname>/api/articles endpoint
+    var article = new Entity('articles');
+    app
+      .addEntity(article);
+
+
+    // set the list of fields to map in each  view
+    var truncate = function (value, entry) {
+      return value + '(' + entry.values.subValue + ')';
+    };
+    var pagination = function(page, maxPerPage) {
+      return {
+        begin: (page - 1) * maxPerPage,
+        end: page * maxPerPage
+      };
+    };
+    article.dashboardView()
+      .title('Recent articles')
+      .order(1) // display the article panel first in the dashboard
+      .limit(5) // limit the panel to the 5 latest articles
+      .pagination(pagination) // use the custom pagination function to format the API request correctly
+      .addField(new Field('label').isEditLink(true).map(truncate));
+
+    article.listView()
+      .title('All articles') // default title is "List of articles"
+      .pagination(pagination)
+      .addField(new Field('id').label('ID'))
+      .addField(new Field('label'));
+
+    article.creationView()
+      .title('Add a new article') // default title is "Create a article"
+      .addField(new Field('label')) // the default edit field type is "string", and displays as a text input
+      .addField(new Field('body').type('wysiwyg')); // overriding the type allows rich text editing for the body
+
+    article.editionView()
+      .addField(new Field('label'))
+      .addField(new Field('body').type('wysiwyg')
+    );
+
+    NgAdminConfigurationProvider.configure(app);
+  });
+  app.config(function(RestangularProvider) {
+    // Add a response intereceptor.
+    RestangularProvider.addResponseInterceptor(function(data, operation, what, url, response, deferred) {
+      var extractedData;
+      if (operation === 'getList') {
+        extractedData = data.data;
+      } else {
+        extractedData = data.data[0];
+      }
+      return extractedData;
+    });
+  });
+}
 
 'use strict';
 
 angular.module('restfulApp')
-  .controller('MainCtrl', function($scope, DrupalSettings, ArticlesResource, FileUpload, $http, $log) {
+  .controller('AdminCtrl', function($log) {
+    $log.info('ng-admin loaded');
+  }
+);
+
+'use strict';
+
+angular.module('restfulApp')
+  .controller('FormCtrl', function($scope, DrupalSettings, ArticlesResource, FileUpload, $http, $log) {
     $scope.data = DrupalSettings.getData('article');
-    $scope.data.label = 'yes',
-    $scope.data.body = 'Drupal stuff',
+    $scope.data.label = 'yes';
+    $scope.data.body = 'Drupal stuff';
     $scope.serverSide = {};
     $scope.tagsQueryCache = [];
 
@@ -76,43 +144,48 @@ angular.module('restfulApp')
      *   The query string.
      */
     $scope.tagsQuery = function (query) {
-      var url = DrupalSettings.getBasePath() + 'api/v1/tags';
-      var terms = {results: []};
+      if (query && query.length > 1) {
+        var url = DrupalSettings.getBasePath() + 'api/v1/tags';
+        var terms = {results: []};
 
-      var lowerCaseTerm = query.term.toLowerCase();
-      if (angular.isDefined($scope.tagsQueryCache[lowerCaseTerm])) {
-        // Add caching.
-        terms.results = $scope.tagsQueryCache[lowerCaseTerm];
-        query.callback(terms);
-        return;
-      }
-
-      $http.get(url, {
-        params: {
-          string: query.term
+        var lowerCaseTerm = query.toLowerCase();
+        if (angular.isDefined($scope.tagsQueryCache[lowerCaseTerm])) {
+          // Add caching.
+          terms = $scope.tagsQueryCache[lowerCaseTerm];
+          console.log(terms.results, 'CACHED');
+          $scope.tagsChoices = terms.results;
+          return;
         }
-      }).success(function(data) {
 
-        if (data.length == 0) {
-          terms.results.push({
-            text: query.term,
-            id: query.term,
-            isNew: true
-          });
-        }
-        else {
-          angular.forEach(data, function (label, id) {
+        $http.get(url, {
+          params: {
+            string: query
+          }
+        }).success(function(data) {
+
+          if (data.count === 0) {
             terms.results.push({
-              text: label,
-              id: id,
-              isNew: false
+              text: query,
+              id: query,
+              isNew: true
             });
-          });
-          $scope.tagsQueryCache[lowerCaseTerm] = terms;
-        }
-
-        query.callback(terms);
-      });
+          }
+          else {
+            angular.forEach(data.data, function (object) {
+              terms.results.push({
+                text: object.label,
+                id: object.id,
+                isNew: false
+              });
+            });
+            $scope.tagsQueryCache[lowerCaseTerm] = terms;
+          }
+        $scope.tagsChoices = terms.results;
+        });
+      }
+      else {
+        $scope.tagsChoices = [];
+      }
     };
 
     /**
@@ -151,13 +224,14 @@ angular.module('restfulApp')
     };
 
     $scope.onFileSelect = function($files) {
+      var updateFileProperties = function(data) {
+        $scope.data.image = data.data.data[0].id;
+        $scope.serverSide.image = data.data.data[0];
+      };
       //$files: an array of files selected, each file has name, size, and type.
       for (var i = 0; i < $files.length; i++) {
         var file = $files[i];
-        FileUpload.upload(file).then(function(data) {
-          $scope.data.image = data.data.data[0].id;
-          $scope.serverSide.image = data.data.data[0];
-        });
+        FileUpload.upload(file).then(updateFileProperties);
       }
     };
   });
@@ -180,14 +254,14 @@ angular.module('restfulApp')
       var config = {
         withCredentials: true,
         headers: {
-          "X-CSRF-Token": DrupalSettings.getCsrfToken(),
+          'X-CSRF-Token': DrupalSettings.getCsrfToken()
           // Call the correct resource version (v1.5) that has the "body" and
           // "image" fields exposed.
         }
       };
 
       return $http.post(DrupalSettings.getBasePath() + 'api/v1.5/articles', data, config);
-    }
+    };
   });
 
 'use strict';
@@ -229,7 +303,7 @@ angular.module('restfulApp')
      */
     this.getData = function(id) {
       return (angular.isDefined(self.settings.restfulExample.data[id])) ? self.settings.restfulExample.data[id] : {};
-    }
+    };
   });
 
 'use strict';
@@ -253,7 +327,7 @@ angular.module('restfulApp')
         file: file,
         withCredentials:  true,
         headers: {
-          "X-CSRF-Token": DrupalSettings.getCsrfToken()
+          'X-CSRF-Token': DrupalSettings.getCsrfToken()
         }
       });
     };

@@ -72,14 +72,30 @@ abstract class RestfulDataProviderCToolsPlugins extends \RestfulBase implements 
 
     foreach ($this->parseRequestForListFilter() as $filter) {
       foreach ($plugins as $plugin_name => $plugin) {
-        $property = $public_fields[$filter['public_field']]['property'];
+        // Initialize to TRUE for AND and FALSE for OR (neutral value).
+        $match = $filter['conjunction'] == 'AND';
+        for ($index = 0; $index < count($filter['value']); $index++) {
+          $property = $public_fields[$filter['public_field']]['property'];
 
-        if (empty($plugin[$property])) {
-          // Property doesn't exist on the plugin, so filter it out.
-          unset($plugins[$plugin_name]);
+          if (empty($plugin[$property])) {
+            // Property doesn't exist on the plugin, so filter it out.
+            unset($plugins[$plugin_name]);
+          }
+
+          if ($filter['conjunction'] == 'OR') {
+            $match = $match || $this->evaluateExpression($plugin[$property], $filter['value'][$index], $filter['operator'][$index]);
+            if ($match) {
+              break;
+            }
+          }
+          else {
+            $match = $match && $this->evaluateExpression($plugin[$property], $filter['value'][$index], $filter['operator'][$index]);
+            if (!$match) {
+              break;
+            }
+          }
         }
-
-        if (!$this->evaluateExpression($plugin[$property], $filter['value'], $filter['operator'])) {
+        if (!$match) {
           // Property doesn't match the filter.
           unset($plugins[$plugin_name]);
         }
@@ -92,6 +108,23 @@ abstract class RestfulDataProviderCToolsPlugins extends \RestfulBase implements 
     }
 
     return $plugins;
+  }
+
+  /**
+   * Overrides \RestfulBase::isValidConjuctionForFilter().
+   */
+  protected static function isValidConjunctionForFilter($conjunction) {
+    $allowed_conjunctions = array(
+      'AND',
+      'OR',
+    );
+
+    if (!in_array(strtoupper($conjunction), $allowed_conjunctions)) {
+      throw new \RestfulBadRequestException(format_string('Conjunction "@conjunction" is not allowed for filtering on this resource. Allowed conjunctions are: !allowed', array(
+        '@conjunction' => $conjunction,
+        '!allowed' => implode(', ', $allowed_conjunctions),
+      )));
+    }
   }
 
   /**
@@ -173,9 +206,11 @@ abstract class RestfulDataProviderCToolsPlugins extends \RestfulBase implements 
    *   (optional) Injected authentication manager.
    * @param DrupalCacheInterface $cache_controller
    *   (optional) Injected cache backend.
+   * @param string $language
+   *   (optional) The language to return items in.
    */
-  public function __construct(array $plugin, \RestfulAuthenticationManager $auth_manager = NULL, \DrupalCacheInterface $cache_controller = NULL) {
-    parent::__construct($plugin, $auth_manager, $cache_controller);
+  public function __construct(array $plugin, \RestfulAuthenticationManager $auth_manager = NULL, \DrupalCacheInterface $cache_controller = NULL, $language = NULL) {
+    parent::__construct($plugin, $auth_manager, $cache_controller, $language);
 
     // Validate keys exist in the plugin's "data provider options".
     $required_keys = array(
@@ -198,7 +233,6 @@ abstract class RestfulDataProviderCToolsPlugins extends \RestfulBase implements 
   }
 
   public function index() {
-    // TODO: Right now render cache only works for Entity based resources.
     $return = array();
 
     foreach (array_keys($this->getPluginsSortedAndFiltered()) as $plugin_name) {
@@ -214,6 +248,16 @@ abstract class RestfulDataProviderCToolsPlugins extends \RestfulBase implements 
    * @todo: We should generalize this, as it's repeated often.
    */
   public function view($id) {
+    $cache_id = array(
+      'md' => $this->getModule(),
+      'tp' => $this->getType(),
+      'id' => $id,
+    );
+    $cached_data = $this->getRenderedCache($cache_id);
+    if (!empty($cached_data->data)) {
+      return $cached_data->data;
+    }
+
     if (!$plugin = ctools_get_plugins($this->getModule(), $this->getType(), $id)) {
       // Since the discovery resource sits under 'api/' it will pick up all
       // invalid paths like 'api/invalid'. If it is not a valid plugin then
@@ -224,6 +268,13 @@ abstract class RestfulDataProviderCToolsPlugins extends \RestfulBase implements 
     // Loop over all the defined public fields.
     foreach ($this->getPublicFields() as $public_field_name => $info) {
       $value = NULL;
+
+      if ($info['create_or_update_passthrough']) {
+        // The public field is a dummy one, meant only for passing data upon
+        // create or update.
+        continue;
+      }
+
       // If there is a callback defined execute it instead of a direct mapping.
       if ($info['callback']) {
         $value = static::executeCallback($info['callback'], array($plugin));
@@ -243,6 +294,7 @@ abstract class RestfulDataProviderCToolsPlugins extends \RestfulBase implements 
       $output[$public_field_name] = $value;
     }
 
+    $this->setRenderedCache($output, $cache_id);
     return $output;
   }
 }

@@ -11,7 +11,7 @@ class RestfulDiscoveryTestCase extends RestfulCurlBaseTestCase {
     return array(
       'name' => 'Discovery',
       'description' => 'Test the discovery features.',
-      'group' => 'Restful',
+      'group' => 'RESTful',
     );
   }
 
@@ -87,7 +87,7 @@ class RestfulDiscoveryTestCase extends RestfulCurlBaseTestCase {
         ),
         'form_element' => array (
           'allowed_values' => NULL,
-          'type' => 'texfield',
+          'type' => 'textfield',
           'default_value' => '',
           'placeholder' => '',
           'size' => 255,
@@ -135,6 +135,47 @@ class RestfulDiscoveryTestCase extends RestfulCurlBaseTestCase {
       ksort($expected_info);
       $this->assertEqual($result_info, $expected_info, format_string('The "info" information is properly described for @field.', array('@field' => $public_field)));
     }
+  }
+
+  /**
+   * Field discovery allowed values.
+   */
+  public function testFieldDiscoveryAllowedValues() {
+    $handler = restful_get_restful_handler('test_articles', 1, 2);
+
+    // Add entity reference fields.
+    restful_test_add_fields('node', 'article');
+
+    // Create 3 nodes.
+    $expected_result = array();
+    foreach (array(1, 2, 3) as $id) {
+      $title = 'article' . '/' . $id;
+      $settings = array(
+        'title' => $title,
+        'type' => 'article',
+
+      );
+      $node = $this->drupalCreateNode($settings);
+      $expected_result[$node->nid] = $title;
+    }
+
+    // Set widget to select list.
+    $instance = field_info_instance('node', 'entity_reference_single', 'article');
+    $instance['widget']['type'] = 'options_select';
+    field_update_instance($instance);
+
+    $result = $handler->options();
+    $this->assertEqual($result['entity_reference_single']['form_element']['allowed_values'], $expected_result);
+
+    // Set widget to autocomplete.
+    $instance['widget']['type'] = 'entityreference_autocomplete';
+    field_update_instance($instance);
+
+    // Invalidate public fields cache.
+    $handler->setPublicFields(array());
+
+    $result = $handler->options();
+    $this->assertNull($result['entity_reference_single']['form_element']['allowed_values']);
   }
 
 

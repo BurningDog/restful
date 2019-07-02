@@ -15,11 +15,17 @@ abstract class RestfulDataProviderDbQuery extends \RestfulBase implements \Restf
   protected $tableName;
 
   /**
-   * The name of the column in the table to be used as the unique key.
+   * The name of the column(s) in the table to be used as the unique key.
    *
-   * @var string
+   * @var array
    */
   protected $idColumn;
+
+  /**
+   * The separator used to divide a key into its table columns when there is
+   * more than one column.
+   */
+  const COLUMN_IDS_SEPARATOR = '::';
 
   /**
    * Holds the primary field.
@@ -31,11 +37,12 @@ abstract class RestfulDataProviderDbQuery extends \RestfulBase implements \Restf
   /**
    * Get ID column
    *
-   * @return string
-   *   The name of the column in the table to be used as the unique key.
+   * @return array
+   *   An array with the name of the column(s) in the table to be used as the
+   *   unique key.
    */
   public function getIdColumn() {
-    return $this->idColumn;
+    return is_array($this->idColumn) ? $this->idColumn : array($this->idColumn);
   }
 
   /**
@@ -69,6 +76,20 @@ abstract class RestfulDataProviderDbQuery extends \RestfulBase implements \Restf
   }
 
   /**
+   * @return string
+   **/
+  public function getPrimary() {
+    return $this->primary;
+  }
+
+  /**
+   * @param string $primary
+   **/
+  public function setPrimary($primary) {
+    $this->primary = $primary;
+  }
+
+  /**
    * Constructs a RestfulDataProviderDbQuery object.
    *
    * @param array $plugin
@@ -77,9 +98,11 @@ abstract class RestfulDataProviderDbQuery extends \RestfulBase implements \Restf
    *   (optional) Injected authentication manager.
    * @param DrupalCacheInterface $cache_controller
    *   (optional) Injected cache backend.
+   * @param string $language
+   *   (optional) The language to return items in.
    */
-  public function __construct(array $plugin, \RestfulAuthenticationManager $auth_manager = NULL, \DrupalCacheInterface $cache_controller = NULL) {
-    parent::__construct($plugin, $auth_manager, $cache_controller);
+  public function __construct(array $plugin, \RestfulAuthenticationManager $auth_manager = NULL, \DrupalCacheInterface $cache_controller = NULL, $language = NULL) {
+    parent::__construct($plugin, $auth_manager, $cache_controller, $language);
 
     // Validate keys exist in the plugin's "data provider options".
     $required_keys = array(
@@ -90,16 +113,43 @@ abstract class RestfulDataProviderDbQuery extends \RestfulBase implements \Restf
 
     $this->tableName = $options['table_name'];
     $this->idColumn = $options['id_column'];
-    $this->primary = empty($plugin['primary']) ? NULL : $this->primary = $plugin['primary'];
+    $this->primary = empty($plugin['data_provider_options']['primary']) ? NULL : $this->primary = $plugin['data_provider_options']['primary'];
+  }
+
+  /**
+   * Defines default sort columns if none are provided via the request URL.
+   *
+   * @return array
+   *   Array keyed by the database column name, and the order ('ASC' or 'DESC') as value.
+   */
+  public function defaultSortInfo() {
+    $sorts = array();
+    foreach ($this->getIdColumn() as $column) {
+      if (!empty($this->getPublicFields[$column])) {
+        // Sort by the first ID column that is a public field.
+        $sorts[$column] = 'ASC';
+        break;
+      }
+    }
+    return $sorts;
+  }
+
+  /**
+   * Get a basic query object.
+   *
+   * @return SelectQuery
+   *   A new SelectQuery object for this connection.
+   */
+  protected function getQuery() {
+    $table = $this->getTableName();
+    return db_select($table)->fields($table);
   }
 
   /**
    * {@inheritdoc}
    */
   public function getQueryForList() {
-    $table = $this->getTableName();
-    $query = db_select($table)
-      ->fields($table);
+    $query = $this->getQuery();
 
     $this->queryForListSort($query);
     $this->queryForListFilter($query);
@@ -121,15 +171,15 @@ abstract class RestfulDataProviderDbQuery extends \RestfulBase implements \Restf
    */
   protected function queryForListSort(\SelectQuery $query) {
     $public_fields = $this->getPublicFields();
+
     // Get the sorting options from the request object.
     $sorts = $this->parseRequestForListSort();
-    if (empty($sorts)) {
-      $query->orderBy($this->getIdColumn(), 'ASC');
-      return;
-    }
+
+    $sorts = $sorts ? $sorts : $this->defaultSortInfo();
 
     foreach ($sorts as $sort => $direction) {
-      $query->orderBy($public_fields[$sort]['property'], $direction);
+      $column_name = $this->getPropertyColumnForQuery($public_fields[$sort]);
+      $query->orderBy($column_name, $direction);
     }
   }
 
@@ -146,7 +196,27 @@ abstract class RestfulDataProviderDbQuery extends \RestfulBase implements \Restf
   protected function queryForListFilter(\SelectQuery $query) {
     $public_fields = $this->getPublicFields();
     foreach ($this->parseRequestForListFilter() as $filter) {
-      $query->condition($public_fields[$filter['public_field']]['property'], $filter['value'], $filter['operator']);
+      if (in_array(strtoupper($filter['operator'][0]), array('IN', 'NOT IN', 'BETWEEN'))) {
+        $column_name = $this->getPropertyColumnForQuery($public_fields[$filter['public_field']]);
+        if (is_array($filter['value']) && empty($filter['value'])) {
+          if (strtoupper($filter['operator'][0]) == 'NOT IN') {
+            // Skip filtering by an empty value when operator is 'NOT IN',
+            // since it throws an SQL error.
+            continue;
+          }
+          // Since Drupal doesn't know how to handle an empty array within a
+          // condition we add the `NULL` as an element to the array.
+          $filter['value'] = array(NULL);
+        }
+        $query->condition($column_name, $filter['value'], $filter['operator'][0]);
+        continue;
+      }
+      $condition = db_condition($filter['conjunction']);
+      for ($index = 0; $index < count($filter['value']); $index++) {
+        $column_name = $this->getPropertyColumnForQuery($public_fields[$filter['public_field']]);
+        $condition->condition($column_name, $filter['value'][$index], $filter['operator'][$index]);
+      }
+      $query->condition($condition);
     }
   }
 
@@ -169,17 +239,51 @@ abstract class RestfulDataProviderDbQuery extends \RestfulBase implements \Restf
   }
 
   /**
+   * Return the column name that should be used for query.
+   *
+   * As MySql prevents using the column alias on WHERE or ORDER BY, we give
+   * implementers a chance to explicitly define the real coloumn for the query.
+   *
+   * @param $public_field_name
+   *   The public field name.
+   *
+   * @return string
+   *   The column name.
+   */
+  protected function getPropertyColumnForQuery($public_field_name) {
+    $public_fields = $this->getPublicFields();
+    return !empty($public_fields[$public_field_name['property']]['column_for_query']) ? $public_fields[$public_field_name['property']]['column_for_query'] : $public_field_name['property'];
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  protected function addDefaultValuesToPublicFields(array $public_fields = array()) {
+    // Set defaults values.
+    $public_fields = parent::addDefaultValuesToPublicFields($public_fields);
+    foreach (array_keys($public_fields) as $key) {
+      $info = &$public_fields[$key];
+      $info += array(
+        'column_for_query' => FALSE,
+      );
+    }
+
+    return $public_fields;
+  }
+
+  /**
    * {@inheritdoc}
    */
   public function getQueryCount() {
     $table = $this->getTableName();
-    $query = db_select($table)
-      ->fields($table);
+    $query = $this->getQuery();
 
     if ($path = $this->getPath()) {
       $ids = explode(',', $path);
       if (!empty($ids)) {
-        $query->condition($table . '.' . $this->getIdColumn(), $ids, 'IN');
+        foreach ($this->getIdColumn() as $index => $column) {
+          $query->condition($table . '.' . $column, $this->getColumnFromIds($ids, $index), 'IN');
+        }
       }
     }
 
@@ -196,7 +300,8 @@ abstract class RestfulDataProviderDbQuery extends \RestfulBase implements \Restf
   public function getTotalCount() {
     return intval($this
       ->getQueryCount()
-      ->execute());
+      ->execute()
+      ->fetchField());
   }
 
   /**
@@ -219,8 +324,6 @@ abstract class RestfulDataProviderDbQuery extends \RestfulBase implements \Restf
       ->getQueryForList()
       ->execute();
 
-    // TODO: Right now render cache only works for Entity based resources.
-
     $return = array();
 
     foreach ($results as $result) {
@@ -234,15 +337,25 @@ abstract class RestfulDataProviderDbQuery extends \RestfulBase implements \Restf
    * {@inheritdoc}
    */
   public function viewMultiple(array $ids) {
+    $cache_id = array(
+      'tb' => $this->getTableName(),
+      'cl' => implode(',', $this->getIdColumn()),
+      'id' => implode(',', $ids),
+    );
+    $cached_data = $this->getRenderedCache($cache_id);
+    if (!empty($cached_data->data)) {
+      return $cached_data->data;
+    }
+
     // Get a list query with all the sorting and pagination in place.
     $query = $this->getQueryForList();
     if (empty($ids)) {
       return array();
     }
-    $query->condition($this->getTableName() . '.' . $this->getIdColumn(), $ids, 'IN');
+    foreach ($this->getIdColumn() as $index => $column) {
+      $query->condition($this->getTableName() . '.' . $column, $this->getColumnFromIds($ids, $index), 'IN');
+    }
     $results = $query->execute();
-
-    // TODO: Right now render cache only works for Entity based resources.
 
     $return = array();
 
@@ -250,30 +363,15 @@ abstract class RestfulDataProviderDbQuery extends \RestfulBase implements \Restf
       $return[] = $this->mapDbRowToPublicFields($result);
     }
 
+    $this->setRenderedCache($return, $cache_id);
     return $return;
   }
 
   /**
    * {@inheritdoc}
    */
-  public function view($id) {
-    $table = $this->getTableName();
-    $query = db_select($table)
-      ->fields($table);
-    $query->condition($this->getTableName() . '.' . $this->getIdColumn(), $id);
-
-    $this->addExtraInfoToQuery($query);
-    $results = $query->execute();
-
-    // TODO: Right now render cache only works for Entity based resources.
-
-    $return = array();
-
-    foreach ($results as $result) {
-      $return[] = $this->mapDbRowToPublicFields($result);
-    }
-
-    return $return;
+  public function view($ids) {
+    return $this->viewMultiple(explode(',', $ids));
   }
 
   /**
@@ -287,69 +385,131 @@ abstract class RestfulDataProviderDbQuery extends \RestfulBase implements \Restf
    * {@inheritdoc}
    */
   public function update($id, $full_replace = FALSE) {
-    $query = db_update($this->getTableName());
-    $query->condition($this->getIdColumn(), $id);
-
     // Build the update array.
     $request = $this->getRequest();
     static::cleanRequest($request);
+    $save = FALSE;
+    $original_request = $request;
+
     $public_fields = $this->getPublicFields();
-    $fields = array();
-    foreach ($public_fields as $public_property => $info) {
+
+    $id_columns = $this->getIdColumn();
+
+    $record = array();
+    foreach ($public_fields as $public_field_name => $info) {
+      // Ignore passthrough public fields.
+      if (!empty($info['create_or_update_passthrough'])) {
+        unset($original_request[$public_field_name]);
+        continue;
+      }
+
       // If this is the primary field, skip.
       if ($this->isPrimaryField($info['property'])) {
         continue;
       }
-      // Check if the public property is set in the payload.
-      if (!isset($request[$public_property])) {
-        if ($full_replace) {
-          $fields[$info['property']] = NULL;
-        }
+
+      if (isset($request[$public_field_name])) {
+        $record[$info['property']] = $request[$public_field_name];
       }
-      else {
-        $fields[$info['property']] = $request[$public_property];
+      // For unset fields on full updates, pass NULL to drupal_write_record().
+      elseif ($full_replace) {
+        $record[$info['property']] = NULL;
       }
-    }
-    if (empty($fields)) {
-      return $this->view($id);
+
+      unset($original_request[$public_field_name]);
+      $save = TRUE;
     }
 
-    // Once the update array is built, execute the query.
-    $query->fields($fields)->execute();
-    return $this->view($id, TRUE);
+    // No request was sent.
+    if (!$save) {
+      throw new \RestfulBadRequestException('No values were sent with the request.');
+    }
+
+    // If the original request is not empty, then illegal values are present.
+    if (!empty($original_request)) {
+      $error_message = format_plural(count($original_request), 'Property @names is invalid.', 'Property @names are invalid.', array('@names' => implode(', ', array_keys($original_request))));
+      throw new \RestfulBadRequestException($error_message);
+    }
+
+    // Add the id column values into the record.
+    foreach ($this->getIdColumn() as $index => $column) {
+      $record[$column] = current($this->getColumnFromIds(array($id), $index));
+    }
+
+    // Once the record is built, write it.
+    if (!drupal_write_record($this->getTableName(), $record, $id_columns)) {
+      throw new \RestfulServiceUnavailable('Record could not be updated to the database.');
+    }
+
+    // Clear the rendered cache before calling the view method.
+    $this->clearRenderedCache(array(
+      'tb' => $this->getTableName(),
+      'cl' => implode(',', $this->getIdColumn()),
+      'id' => $id,
+    ));
+
+    return $this->view($id);
   }
 
   /**
    * {@inheritdoc}
    */
   public function create() {
-    $query = db_insert($this->getTableName());
-
-    // Build the update array.
     $request = $this->getRequest();
     static::cleanRequest($request);
+    $save = FALSE;
+    $original_request = $request;
+
     $public_fields = $this->getPublicFields();
-    $fields = array();
-    $passed_id = NULL;
-    foreach ($public_fields as $public_property => $info) {
-      // Check if the public property is set in the payload.
-      if ($info['property'] == $this->getIdColumn()) {
-        $passed_id = $request[$public_property];
+    $id_columns = $this->getIdColumn();
+
+
+    $record = array();
+    foreach ($public_fields as $public_field_name => $info) {
+      // Ignore passthrough public fields.
+      if (!empty($info['create_or_update_passthrough'])) {
+        unset($original_request[$public_field_name]);
+        continue;
       }
-      if (isset($request[$public_property])) {
-        $fields[$info['property']] = $request[$public_property];
+
+      // If this is the primary field, skip.
+      if ($this->isPrimaryField($info['property'])) {
+        unset($original_request[$public_field_name]);
+        continue;
       }
+
+      if (isset($request[$public_field_name])) {
+        $record[$info['property']] = $request[$public_field_name];
+      }
+
+      unset($original_request[$public_field_name]);
+      $save = TRUE;
     }
 
-    // Once the update array is built, execute the query.
-    if ($id = $query->fields($fields)->execute()) {
-      return $this->view($id, TRUE);
+    // No request was sent.
+    if (!$save) {
+      throw new \RestfulBadRequestException('No values were sent with the request.');
     }
-    // Some times db_insert does not know how to get the ID.
-    if ($passed_id) {
-      return $this->view($passed_id);
+
+    // If the original request is not empty, then illegal values are present.
+    if (!empty($original_request)) {
+      $error_message = format_plural(count($original_request), 'Property @names is invalid.', 'Property @names are invalid.', array('@names' => implode(', ', array_keys($original_request))));
+      throw new \RestfulBadRequestException($error_message);
+    }
+
+    // Once the record is built, write it and view it.
+    if (drupal_write_record($this->getTableName(), $record)) {
+      // Handle multiple id columns.
+      $id_values = array();
+      foreach ($id_columns as $id_column) {
+        $id_values[$id_column] = $record[$id_column];
+      }
+      $id = implode(self::COLUMN_IDS_SEPARATOR, $id_values);
+
+      return $this->view($id);
     }
     return;
+
   }
 
   /**
@@ -360,9 +520,12 @@ abstract class RestfulDataProviderDbQuery extends \RestfulBase implements \Restf
     // Set the HTTP headers.
     $this->setHttpHeaders('Status', 204);
 
-    db_delete($this->getTableName())
-      ->condition($this->getIdColumn(), $id)
-      ->execute();
+    $query = db_delete($this->getTableName());
+    foreach ($this->getIdColumn() as $index => $column) {
+      $query->condition($column, current($this->getColumnFromIds(array($id), $index)));
+    }
+
+    $query->execute();
   }
 
   /**
@@ -371,18 +534,26 @@ abstract class RestfulDataProviderDbQuery extends \RestfulBase implements \Restf
   public function mapDbRowToPublicFields($row) {
     if ($this->getMethod() == \RestfulInterface::GET) {
       // For read operations cache the result.
-      $output = &drupal_static(__CLASS__ . '::' . __FUNCTION__ . '::' . $this->getUniqueId($row));
+      $output = $this->staticCache->get(__CLASS__ . '::' . __FUNCTION__ . '::' . $this->getUniqueId($row));
       if (isset($output)) {
         return $output;
       }
     }
     else {
       // Clear the cache if the request is not GET.
-      drupal_static_reset(__CLASS__ . '::' . __FUNCTION__ . '::' . $this->getUniqueId($row));
+      $this->staticCache->clear(__CLASS__ . '::' . __FUNCTION__ . '::' . $this->getUniqueId($row));
     }
+    $output = array();
     // Loop over all the defined public fields.
     foreach ($this->getPublicFields() as $public_field_name => $info) {
       $value = NULL;
+
+      if ($info['create_or_update_passthrough']) {
+        // The public field is a dummy one, meant only for passing data upon
+        // create or update.
+        continue;
+      }
+
       // If there is a callback defined execute it instead of a direct mapping.
       if ($info['callback']) {
         $value = static::executeCallback($info['callback'], array($row));
@@ -393,7 +564,7 @@ abstract class RestfulDataProviderDbQuery extends \RestfulBase implements \Restf
       }
 
       // Execute the process callbacks.
-      if ($value && $info['process_callbacks']) {
+      if (isset($value) && $info['process_callbacks']) {
         foreach ($info['process_callbacks'] as $process_callback) {
           $value = static::executeCallback($process_callback, array($value));
         }
@@ -415,7 +586,13 @@ abstract class RestfulDataProviderDbQuery extends \RestfulBase implements \Restf
    *   The ID
    */
   public function getUniqueId($row) {
-    return $this->getTableName() . '::' . $row->{$this->getIdColumn()};
+    $keys = array($this->getTableName());
+
+    foreach ($this->getIdColumn() as $column) {
+      $keys[] = $row->{$column};
+    }
+
+    return implode(self::COLUMN_IDS_SEPARATOR, $keys);
   }
 
   /**
@@ -429,5 +606,29 @@ abstract class RestfulDataProviderDbQuery extends \RestfulBase implements \Restf
    */
   function isPrimaryField($field) {
     return $this->primary == $field;
+  }
+
+  /**
+   * Given an array of string ID's return a single column. for example:
+   *
+   * Strings are divided by the delimiter self::COLUMN_IDS_SEPARATOR.
+   *
+   * @param array $ids
+   *   An array of object IDs.
+   * @param int $column
+   *   0-N Zero indexed
+   *
+   * @return Array
+   *   Returns an array at index $column
+   */
+  protected function getColumnFromIds(array $ids, $column = 0) {
+    // Get a single column.
+    return array_map(function($id) use ($column) {
+      $parts = explode(RestfulDataProviderDbQuery::COLUMN_IDS_SEPARATOR, $id);
+      if (!isset($parts[$column])) {
+        throw new \RestfulServerConfigurationException('Invalid ID provided.');
+      }
+      return $parts[$column];
+    }, $ids);
   }
 }

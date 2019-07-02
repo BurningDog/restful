@@ -30,6 +30,9 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
    *   content. This can be used for example on a text field with filtered text
    *   input format where we would need to do $wrapper->body->value->value().
    *   Defaults to FALSE.
+   * - "formatter": Used for rendering the value of a configurable field using
+   *   Drupal field API's formatter. The value is the $display value that is
+   *   passed to field_view_field().
    * - "wrapper_method": The wrapper's method name to perform on the field.
    *   This can be used for example to get the entity label, by setting the
    *   value to "label". Defaults to "value".
@@ -66,6 +69,9 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
    *       'full_view' => FALSE,
    *     ),
    *   );
+   * - "create_or_update_passthrough": Determines if a public field that isn't
+   *   mapped to any property or field, may be passed upon create or update
+   *   of an entity. Defaults to FALSE.
    *
    * @var array
    */
@@ -83,7 +89,7 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
         // POST
         \RestfulInterface::POST => 'createEntity',
       ),
-      '^(\d+,)*\d+$' => array(
+      '^.*$' => array(
         \RestfulInterface::GET => 'viewEntities',
         \RestfulInterface::HEAD => 'viewEntities',
         \RestfulInterface::PUT => 'putEntity',
@@ -128,8 +134,12 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
 
     $return = array();
 
+    // If no IDs were requested, we should not throw an exception in case an
+    // entity is un-accessible by the user.
     foreach ($ids as $id) {
-      $return[] = $this->viewEntity($id);
+      if ($row = $this->viewEntity($id)) {
+        $return[] = $row;
+      }
     }
 
     return $return;
@@ -138,12 +148,12 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
   /**
    * {@inheritdoc}
    */
-  public function viewEntities($entity_ids_string) {
-    $entity_ids = array_unique(array_filter(explode(',', $entity_ids_string)));
+  public function viewEntities($ids_string) {
+    $ids = array_unique(array_filter(explode(',', $ids_string)));
     $output = array();
 
-    foreach ($entity_ids as $entity_id) {
-      $output[] = $this->viewEntity($entity_id);
+    foreach ($ids as $id) {
+      $output[] = $this->viewEntity($id);
     }
     return $output;
   }
@@ -161,7 +171,7 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
    * @throws \Exception
    */
   protected function getListForAutocomplete() {
-    $entity_info = entity_get_info($this->getEntityType());
+    $entity_info = $this->getEntityInfo();
     if (empty($entity_info['entity keys']['label'])) {
       // Entity is invalid for autocomplete, as it doesn't have a "label"
       // property.
@@ -192,7 +202,11 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
    *   Array with the bundle name(s).
    */
   protected function getBundlesForAutocomplete() {
-    return array($this->getBundle());
+    $info = $this->getEntityInfo();
+    // When a bundle key wasn't defined return false in order to make the
+    // autocomplete support entities without bundle key. i.e: user, vocabulary.
+    $bundle = $this->getBundle();
+    return !empty($bundle) && !empty($info['entity keys']['bundle']) ? array($bundle) : FALSE;
   }
 
   /**
@@ -204,13 +218,13 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
   protected function getQueryForAutocomplete() {
     $autocomplete_options = $this->getPluginKey('autocomplete');
     $entity_type = $this->getEntityType();
-    $entity_info = entity_get_info($entity_type);
+    $entity_info = $this->getEntityInfo();
     $request = $this->getRequest();
 
     $string = drupal_strtolower($request['autocomplete']['string']);
     $operator = !empty($request['autocomplete']['operator']) ? $request['autocomplete']['operator'] : $autocomplete_options['operator'];
 
-    $query = new EntityFieldQuery();
+    $query = $this->EFQObject();
 
     $query->entityCondition('entity_type', $entity_type);
     if ($bundles = $this->getBundlesForAutocomplete()) {
@@ -263,20 +277,21 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
   /**
    * {@inheritdoc}
    */
-  public function viewEntity($entity_id) {
+  public function viewEntity($id) {
+    $entity_id = $this->getEntityIdByFieldId($id);
     $request = $this->getRequest();
 
-    $cached_data = $this->getRenderedCache(array(
-      'et' => $this->getEntityType(),
-      'ei' => $entity_id,
-    ));
+    $cached_data = $this->getRenderedCache($this->getEntityCacheTags($entity_id));
     if (!empty($cached_data->data)) {
       return $cached_data->data;
     }
 
-    $this->isValidEntity('view', $entity_id);
+    if (!$this->isValidEntity('view', $entity_id)) {
+      return;
+    }
 
     $wrapper = entity_metadata_wrapper($this->entityType, $entity_id);
+    $wrapper->language($this->getLangCode());
     $values = array();
 
     $limit_fields = !empty($request['fields']) ? explode(',', $request['fields']) : array();
@@ -289,13 +304,18 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
 
       $value = NULL;
 
+      if ($info['create_or_update_passthrough']) {
+        // The public field is a dummy one, meant only for passing data upon
+        // create or update.
+        continue;
+      }
+
       if ($info['callback']) {
         $value = static::executeCallback($info['callback'], array($wrapper));
       }
       else {
         // Exposing an entity field.
         $property = $info['property'];
-
         $sub_wrapper = $info['wrapper_method_on_entity'] ? $wrapper : $wrapper->{$property};
 
         // Check user has access to the property.
@@ -303,44 +323,25 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
           continue;
         }
 
-        $method = $info['wrapper_method'] ? $info['wrapper_method'] : NULL;
-        $resource = $info['resource'] ? $info['resource'] : NULL;
-
-        if ($sub_wrapper instanceof EntityListWrapper) {
-          // Multiple value.
-          foreach ($sub_wrapper as $item_wrapper) {
-            if ($info['sub_property'] && $item_wrapper->value()) {
-              $item_wrapper = $item_wrapper->{$info['sub_property']};
+        if (empty($info['formatter'])) {
+          if ($sub_wrapper instanceof EntityListWrapper) {
+            // Multiple values.
+            foreach ($sub_wrapper as $item_wrapper) {
+              $value[] = $this->getValueFromProperty($wrapper, $item_wrapper, $info, $public_field_name);
             }
-
-            if ($resource) {
-              if ($value_from_resource = $this->getValueFromResource($item_wrapper, $property, $resource)) {
-                $value[] = $value_from_resource;
-              }
-            }
-            else {
-              // Wrapper method.
-              $value[] = $item_wrapper->{$method}();
-            }
+          }
+          else {
+            // Single value.
+            $value = $this->getValueFromProperty($wrapper, $sub_wrapper, $info, $public_field_name);
           }
         }
         else {
-          // Single value.
-          if ($info['sub_property'] && $sub_wrapper->value()) {
-            $sub_wrapper = $sub_wrapper->{$info['sub_property']};
-          }
-
-          if ($resource) {
-            $value = $this->getValueFromResource($sub_wrapper, $property, $resource);
-          }
-          else {
-            // Wrapper method.
-            $value = $sub_wrapper->{$method}();
-          }
+          // Get value from field formatter.
+          $value = $this->getValueFromFieldFormatter($wrapper, $sub_wrapper, $info);
         }
       }
 
-      if ($value && $info['process_callbacks']) {
+      if (isset($value) && $info['process_callbacks']) {
         foreach ($info['process_callbacks'] as $process_callback) {
           $value = static::executeCallback($process_callback, array($value));
         }
@@ -349,38 +350,153 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
       $values[$public_field_name] = $value;
     }
 
-    $this->setRenderedCache($values, array(
-      'et' => $this->getEntityType(),
-      'ei' => $entity_id,
-    ));
+    $this->setRenderedCache($values, $this->getEntityCacheTags($entity_id));
     return $values;
   }
 
   /**
-   * Get the "target_type" property from an entity reference field.
+   * The array of parameters by which entities should be cached.
    *
-   * @param $property
+   * @param mixed $entity_id
+   *   The entity ID of the entity to be cached.
+   *
+   * @return array
+   *   An array of parameter keys and values which should be added
+   *   to the cache key for each entity.
+   */
+  public function getEntityCacheTags($entity_id) {
+    return array(
+      'et' => $this->getEntityType(),
+      'ei' => $entity_id,
+    );
+  }
+
+  /**
+   * Get value from a property.
+   *
+   * @param EntityMetadataWrapper $wrapper
+   *   The wrapped entity.
+   * @param EntityMetadataWrapper $sub_wrapper
+   *   The wrapped property.
+   * @param array $info
+   *   The public field info array.
+   * @param $public_field_name
    *   The field name.
+   *
+   * @return mixed
+   *   A single or multiple values.
+   */
+  protected function getValueFromProperty(\EntityMetadataWrapper $wrapper, \EntityMetadataWrapper $sub_wrapper, array $info, $public_field_name) {
+    $property = $info['property'];
+    $method = $info['wrapper_method'];
+    $resource = $info['resource'] ?: NULL;
+
+    if ($info['sub_property'] && $sub_wrapper->value()) {
+      $sub_wrapper = $sub_wrapper->{$info['sub_property']};
+    }
+
+    if ($resource) {
+      $value = $this->getValueFromResource($sub_wrapper, $property, $resource, $public_field_name, $wrapper->getIdentifier());
+    }
+    else {
+      // Wrapper method.
+      $value = $sub_wrapper->{$method}();
+    }
+
+    return $value;
+  }
+
+  /**
+   * Get value from a field rendered by Drupal field API's formatter.
+   *
+   * @param EntityMetadataWrapper $wrapper
+   *   The wrapped entity.
+   * @param EntityMetadataWrapper $sub_wrapper
+   *   The wrapped property.
+   * @param array $info
+   *   The public field info array.
+   *
+   * @return mixed
+   *   A single or multiple values.
+   */
+  protected function getValueFromFieldFormatter(\EntityMetadataWrapper $wrapper, \EntityMetadataWrapper $sub_wrapper, array $info) {
+    $property = $info['property'];
+
+    if (!static::propertyIsField($property)) {
+      // Property is not a field.
+      throw new \RestfulServerConfigurationException(format_string('@property is not a configurable field, so it cannot be processed using field API formatter', array('@property' => $property)));
+    }
+
+    // Get values from the formatter.
+    $output = field_view_field($this->getEntityType(), $wrapper->value(), $property, $info['formatter']);
+
+    // Unset the theme, as we just want to get the value from the formatter,
+    // without the wrapping HTML.
+    unset($output['#theme']);
+
+
+    if ($sub_wrapper instanceof EntityListWrapper) {
+      // Multiple values.
+      foreach (element_children($output) as $delta) {
+        $value[] = drupal_render($output[$delta]);
+      }
+    }
+    else {
+      // Single value.
+      $value = drupal_render($output);
+    }
+
+    return $value;
+  }
+
+  /**
+   * Get the "target_type" property from an field or property reference.
+   *
+   * @param \EntityMetadataWrapper $wrapper
+   *   The wrapped property.
+   * @param $property
+   *   The public field name.
+   *
    * @return string
    *   The target type of the referenced entity.
    *
-   * @throws Exception
-   *   Errors is the passed field name is invalid.
+   * @throws \RestfulException
    */
-  protected function getTargetTypeFromEntityReference($property) {
-    if (!$field = field_info_field($property)) {
-      throw new Exception('Property is not a field.');
-    }
+  protected function getTargetTypeFromEntityReference(\EntityMetadataWrapper $wrapper, $property) {
+    $params = array('@property' => $property);
 
-    if ($field['type'] == 'entityreference') {
-      return $field['settings']['target_type'];
-    }
-    elseif ($field['type'] == 'taxonomy_term_reference') {
-      return 'taxonomy_term';
-    }
+    if ($field = field_info_field($property)) {
+      if ($field['type'] == 'entityreference') {
+        return $field['settings']['target_type'];
+      }
+      elseif ($field['type'] == 'taxonomy_term_reference') {
+        return 'taxonomy_term';
+      }
+      elseif ($field['type'] == 'field_collection') {
+        return 'field_collection_item';
+      }
+      elseif ($field['type'] == 'commerce_product_reference') {
+        return 'commerce_product';
+      }
+      elseif ($field['type'] == 'commerce_line_item_reference') {
+        return 'commerce_line_item';
+      }
+      elseif ($field['type'] == 'node_reference') {
+        return 'node';
+      }
 
-    throw new Exception('Property is not an entity reference field.');
+      throw new \RestfulException(format_string('Field @property is not an entity reference or taxonomy reference field.', $params));
+    }
+    else {
+      // This is a property referencing another entity (e.g. the "uid" on the
+      // node object).
+      $info = $wrapper->info();
+      if ($this->getEntityInfo($info['type'])) {
+        return $info['type'];
+      }
 
+      throw new \RestfulException(format_string('Property @property is not defined as reference in the EntityMetadataWrapper definition.', $params));
+    }
   }
 
   /**
@@ -392,18 +508,23 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
    *   The property name (i.e. the field name).
    * @param array $resource
    *   Array with resource names, keyed by the bundle name.
+   * @param string $public_field_name
+   *   Field name in the output. This is used to store additional metadata
+   *   useful for the formatter.
+   * @param int $host_id
+   *   Host entity ID. Used to structure the value metadata.
    *
    * @return mixed
    *   The value if found, or NULL if bundle not defined.
    */
-  protected function getValueFromResource(EntityMetadataWrapper $wrapper, $property, $resource) {
-    $handlers = &drupal_static(__FUNCTION__, array());
+  protected function getValueFromResource(EntityMetadataWrapper $wrapper, $property, $resource, $public_field_name = NULL, $host_id = NULL) {
+    $handlers = $this->staticCache->get(__CLASS__ . '::' . __FUNCTION__, array());
 
     if (!$entity = $wrapper->value()) {
       return;
     }
 
-    $target_type = $this->getTargetTypeFromEntityReference($property);
+    $target_type = $this->getTargetTypeFromEntityReference($wrapper, $property);
     list($id,, $bundle) = entity_extract_ids($target_type, $entity);
 
     if (empty($resource[$bundle])) {
@@ -416,11 +537,24 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
       return $wrapper->value(array('identifier' => TRUE));
     }
 
+    if ($public_field_name) {
+      $this->valueMetadata[$host_id][$public_field_name][] = array(
+        'id' => $id,
+        'entity_type' => $target_type,
+        'bundle' => $bundle,
+        'resource_name' => $resource[$bundle]['name'],
+      );
+    }
 
     if (empty($handlers[$bundle])) {
       $handlers[$bundle] = restful_get_restful_handler($resource[$bundle]['name'], $resource[$bundle]['major_version'], $resource[$bundle]['minor_version']);
     }
     $bundle_handler = $handlers[$bundle];
+
+    // Pipe the parent request and account to the sub-request.
+    $piped_request = $this->getRequestForSubRequest();
+    $bundle_handler->setAccount($this->getAccount());
+    $bundle_handler->setRequest($piped_request);
     return $bundle_handler->viewEntity($id);
   }
 
@@ -460,7 +594,7 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
    * {@inheritdoc}
    */
   public function deleteEntity($entity_id) {
-    $this->isValidEntity('update', $entity_id);
+    $this->isValidEntity('delete', $entity_id);
 
     $wrapper = entity_metadata_wrapper($this->entityType, $entity_id);
     $wrapper->delete();
@@ -472,7 +606,8 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
   /**
    * {@inheritdoc}
    */
-  protected function updateEntity($entity_id, $null_missing_fields = FALSE) {
+  protected function updateEntity($id, $null_missing_fields = FALSE) {
+    $entity_id = $this->getEntityIdByFieldId($id);
     $this->isValidEntity('update', $entity_id);
 
     $wrapper = entity_metadata_wrapper($this->entityType, $entity_id);
@@ -482,21 +617,20 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
     // Set the HTTP headers.
     $this->setHttpHeaders('Status', 201);
 
-    if (!empty($wrapper->url) && $url = $wrapper->url->value()); {
+    if (!empty($wrapper->url) && $url = $wrapper->url->value()) {
       $this->setHttpHeaders('Location', $url);
     }
 
     return array($this->viewEntity($wrapper->getIdentifier()));
   }
 
-
   /**
    * {@inheritdoc}
    */
   public function createEntity() {
-    $entity_info = entity_get_info($this->entityType);
+    $entity_info = $this->getEntityInfo();
     $bundle_key = $entity_info['entity keys']['bundle'];
-    $values = array($bundle_key => $this->bundle);
+    $values = $bundle_key ? array($bundle_key => $this->bundle) : array();
 
     $entity = entity_create($this->entityType, $values);
 
@@ -518,9 +652,9 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
    * @param EntityMetadataWrapper $wrapper
    *   The wrapped entity object, passed by reference.
    * @param bool $null_missing_fields
-   *   Determine if properties that are missing form the request array should
+   *   Determine if properties that are missing from the request array should
    *   be treated as NULL, or should be skipped. Defaults to FALSE, which will
-   *   set the fields to NULL.
+   *   skip, instead of setting the fields to NULL.
    *
    * @throws RestfulBadRequestException
    */
@@ -532,6 +666,12 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
     $original_request = $request;
 
     foreach ($this->getPublicFields() as $public_field_name => $info) {
+      if (!empty($info['create_or_update_passthrough'])) {
+        // Allow passing the value in the request.
+        unset($original_request[$public_field_name]);
+        continue;
+      }
+
       if (empty($info['property'])) {
         // We may have for example an entity with no label property, but with a
         // label callback. In that case the $info['property'] won't exist, so
@@ -540,29 +680,39 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
       }
 
       $property_name = $info['property'];
-      if (!isset($request[$public_field_name])) {
+
+      if (!array_key_exists($public_field_name, $request)) {
         // No property to set in the request.
         if ($null_missing_fields && $this->checkPropertyAccess('edit', $public_field_name, $wrapper->{$property_name}, $wrapper)) {
           // We need to set the value to NULL.
-          $wrapper->{$property_name}->set(NULL);
+          $field_value = NULL;
         }
-        continue;
+        else {
+          // Either we shouldn't set missing fields as NULL or access is denied
+          // for the current property, hence we skip.
+          continue;
+        }
       }
-
-      if (!$this->checkPropertyAccess('edit', $public_field_name, $wrapper->{$property_name}, $wrapper)) {
-        throw new RestfulBadRequestException(format_string('Property @name cannot be set.', array('@name' => $public_field_name)));
+      else {
+        // Property is set in the request.
+        $field_value = $this->propertyValuesPreprocess($property_name, $request[$public_field_name], $public_field_name);
       }
-
-      $field_value = $this->propertyValuesPreprocess($property_name, $request[$public_field_name], $public_field_name);
 
       $wrapper->{$property_name}->set($field_value);
+
+      // We check the property access only after setting the values, as the
+      // access callback's response might change according to the field value.
+      if (!$this->checkPropertyAccess('edit', $public_field_name, $wrapper->{$property_name}, $wrapper)) {
+        throw new \RestfulBadRequestException(format_string('Property @name cannot be set.', array('@name' => $public_field_name)));
+      }
+
       unset($original_request[$public_field_name]);
       $save = TRUE;
     }
 
     if (!$save) {
       // No request was sent.
-      throw new RestfulBadRequestException('No values were sent with the request');
+      throw new \RestfulBadRequestException('No values were sent with the request');
     }
 
     if ($original_request) {
@@ -594,12 +744,20 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
    *   The value to set using the wrapped property.
    */
   public function propertyValuesPreprocess($property_name, $value, $public_field_name) {
+    // If value is NULL, just return.
+    if (!isset($value)) {
+      return NULL;
+    }
+
     // Get the field info.
     $field_info = field_info_field($property_name);
 
     switch ($field_info['type']) {
       case 'entityreference':
       case 'taxonomy_term_reference':
+      case 'field_collection':
+      case 'commerce_product_reference':
+      case 'commerce_line_item_reference':
         return $this->propertyValuesPreprocessReference($property_name, $value, $field_info, $public_field_name);
 
       case 'text':
@@ -632,6 +790,11 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
    *   The value to set using the wrapped property.
    */
   protected function propertyValuesPreprocessReference($property_name, $value, $field_info, $public_field_name) {
+    if (!$value) {
+      // If value is empty, return NULL, so no new entity will be created.
+      return;
+    }
+
     if ($field_info['cardinality'] != 1 && !is_array($value)) {
       // If the field is entity reference type and its cardinality larger than
       // 1 set value to an array.
@@ -928,7 +1091,8 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
     // Check format access for text fields.
     if ($property_wrapper->type() == 'text_formatted' && $property_wrapper->value() && $property_wrapper->format->value()) {
       $format = (object) array('format' => $property_wrapper->format->value());
-      if (!filter_access($format, $account)) {
+      // Only check filter access on write contexts.
+      if (\RestfulBase::isWriteMethod($this->getMethod()) && !filter_access($format, $account)) {
         return FALSE;
       }
     }
@@ -1009,7 +1173,15 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
     }
 
     if ($this->checkEntityAccess($op, $entity_type, $entity) === FALSE) {
-      // Entity was explicitly denied.
+
+      if ($op == 'view' && !$this->getPath()) {
+        // Just return FALSE, without an exception, for example when a list of
+        // entities is requested, and we don't want to fail all the list because
+        // of a single item without access.
+        return FALSE;
+      }
+
+      // Entity was explicitly requested so we need to throw an exception.
       throw new RestfulForbiddenException(format_string('You do not have access to entity ID @id of resource @resource', $params));
     }
 
@@ -1021,7 +1193,8 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
    * Check access to CRUD an entity.
    *
    * @param $op
-   *   The operation. Allowed values are "create", "update" and "delete".
+   *   The operation. Allowed values are "view", "create", "update" and
+   *   "delete".
    * @param $entity_type
    *   The entity type.
    * @param $entity
@@ -1040,7 +1213,7 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
    * {@inheritdoc}
    */
   public function publicFieldsInfo() {
-    $entity_info = entity_get_info($this->getEntityType());
+    $entity_info = $this->getEntityInfo();
     $id_key = $entity_info['entity keys']['id'];
 
     $public_fields = array(
@@ -1076,7 +1249,7 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
           ),
           // Information about the form element.
           'form_element' => array(
-            'type' => 'texfield',
+            'type' => 'textfield',
             'size' => 255,
           ),
         ),
@@ -1085,6 +1258,16 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
         'callback' => array($this, 'getEntitySelf'),
       ),
     );
+
+    if ($view_mode_info = $this->getPluginKey('view_mode')) {
+      if (empty($view_mode_info['name'])) {
+        throw new \RestfulServerConfigurationException('View mode not found.');
+      }
+      $view_mode_handler = new \RestfulEntityViewMode($this->getEntityType(), $this->getBundle());
+
+      $public_fields += $view_mode_handler->mapFields($view_mode_info['name'], $view_mode_info['field_map']);
+      return $public_fields;
+    }
 
     if (!empty($entity_info['entity keys']['label'])) {
       $public_fields['label']['property'] = $entity_info['entity keys']['label'];
@@ -1096,29 +1279,21 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
   /**
    * {@inheritdoc}
    */
-  public function getPublicFields() {
-    if ($this->publicFields) {
-      // Return early.
-      return $this->publicFields;
-    }
-
-    // Get the public fields that were defined by the user.
-    $public_fields = $this->publicFieldsInfo();
-
+  protected function addDefaultValuesToPublicFields(array $public_fields = array()) {
+    $public_fields = parent::addDefaultValuesToPublicFields($public_fields);
     // Set defaults values.
     foreach (array_keys($public_fields) as $key) {
-      // Set default values.
+      // Set default values specific for entities.
       $info = &$public_fields[$key];
       $info += array(
         'access_callbacks' => array(),
-        'callback' => FALSE,
         'column' => FALSE,
-        'process_callbacks' => array(),
         'property' => FALSE,
         'resource' => array(),
         'sub_property' => FALSE,
         'wrapper_method' => 'value',
         'wrapper_method_on_entity' => FALSE,
+        'formatter' => FALSE,
       );
 
       if ($field = field_info_field($info['property'])) {
@@ -1136,6 +1311,7 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
         }
       }
 
+
       foreach ($info['resource'] as &$resource) {
         // Expand array to be verbose.
         if (!is_array($resource)) {
@@ -1148,7 +1324,7 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
         );
 
         // Set the default value for the version of the referenced resource.
-        if (empty($resource['major_version']) || empty($resource['minor_version'])) {
+        if (!isset($resource['major_version']) || !isset($resource['minor_version'])) {
           list($major_version, $minor_version) = static::getResourceLastVersion($resource['name']);
           $resource['major_version'] = $major_version;
           $resource['minor_version'] = $minor_version;
@@ -1156,51 +1332,114 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
       }
     }
 
-    // Cache the processed fields.
-    $this->setPublicFields($public_fields);
-
     return $public_fields;
   }
 
   /**
    * Get the field info, data and form element
    *
-   * @param string $field_info
+   * @param string $field
    *   The field info.
    *
    *
    * @return array
    *   Array with the 'info', 'data' and 'form_element' keys.
    */
-  protected function getFieldInfoAndFormSchema($field_info) {
+  protected function getFieldInfoAndFormSchema($field) {
     $discovery_info = array();
-    $instance_info = field_info_instance($this->getEntityType(), $field_info['field_name'], $this->getBundle());
+    $instance_info = field_info_instance($this->getEntityType(), $field['field_name'], $this->getBundle());
 
     $discovery_info['info']['label'] = $instance_info['label'];
     $discovery_info['info']['description'] = $instance_info['description'];
 
-    $discovery_info['data']['type'] = $field_info['type'];
+    $discovery_info['data']['type'] = $field['type'];
     $discovery_info['data']['required'] = $instance_info['required'];
 
-    $discovery_info['form_element']['default_value'] = $instance_info['default_value'];
+    $discovery_info['form_element']['default_value'] = isset($instance_info['default_value']) ? $instance_info['default_value'] : NULL;
 
-    switch($field_info['type']) {
-      case 'list_text':
-        $discovery_info['form_element']['allowed_values'] = $field_info['settings']['allowed_values'];
-        break;
-    }
+    $discovery_info['form_element']['allowed_values'] = $this->getFormSchemaAllowedValues($field);
 
     return array('discovery' => $discovery_info);
   }
 
   /**
-   * Set the public fields.
+   * Get allowed values for the form schema.
    *
-   * @param array $public_fields
-   *   The processed public fields array.
+   * Using Field API's "Options" module to get the allowed values.
+   *
+   * @param array $field
+   *   The field info array.
+   *
+   * @return mix | NULL
+   *   The allowed values or NULL if none found.
    */
-  public function setPublicFields(array $public_fields = array()) {
-    $this->publicFields = $public_fields;
+  protected function getFormSchemaAllowedValues($field) {
+    if (!module_exists('options')) {
+      return;
+    }
+
+    $entity_type = $this->getEntityType();
+    $bundle = $this->getBundle();
+    $instance = field_info_instance($entity_type, $field['field_name'], $bundle);
+
+    if (!$this->formSchemaHasAllowedValues($field, $instance)) {
+      // Field doesn't have allowed values.
+      return;
+    }
+
+    // Use Field API's widget to get the allowed values.
+    $type = str_replace('options_', '', $instance['widget']['type']);
+    $multiple = $field['cardinality'] > 1 || $field['cardinality'] == FIELD_CARDINALITY_UNLIMITED;
+    // Always pass TRUE for "required" and "has_value", as we don't want to get
+    // the "none" option.
+    $required = TRUE;
+    $has_value = TRUE;
+    $properties = _options_properties($type, $multiple, $required, $has_value);
+
+    // Mock an entity.
+    $values = array();
+    $entity_info = $this->getEntityInfo();
+
+    if (!empty($entity_info['entity keys']['bundle'])) {
+      // Set the bundle of the entity.
+      $values[$entity_info['entity keys']['bundle']] = $bundle;
+    }
+
+    $entity = entity_create($entity_type, $values);
+
+    return _options_get_options($field, $instance, $properties, $this->getEntityType(), $entity);
+  }
+
+  /**
+   * Determines if a field has allowed values.
+   *
+   * If Field is reference, and widget is autocomplete, so for performance
+   * reasons we do not try to grab all the referenced entities.
+   *
+   * @param array $field
+   *   The field info array.
+   * @param array $instance
+   *   The instance info array.
+   *
+   * @return bool
+   *   TRUE if a field should be populated with the allowed values.
+   */
+  protected function formSchemaHasAllowedValues($field, $instance) {
+    $field_types = array(
+      'entityreference',
+      'taxonomy_term_reference',
+      'field_collection',
+      'commerce_product_reference',
+    );
+
+    $widget_types = array(
+      'taxonomy_autocomplete',
+      'entityreference_autocomplete',
+      'entityreference_autocomplete_tags',
+      'commerce_product_reference_autocomplete',
+    );
+
+    return !in_array($field['type'], $field_types) || !in_array($instance['widget']['type'], $widget_types);
   }
 
   /**
@@ -1249,21 +1488,91 @@ abstract class RestfulEntityBase extends \RestfulDataProviderEFQ implements \Res
   }
 
   /**
-   * Helper method to determine if an array is numeric.
+   * Clear all caches corresponding to the current resource for a given entity.
    *
-   * @param array $input
-   *   The input array.
-   *
-   * @return boolean
-   *   TRUE if the array is numeric, false otherwise.
+   * @param int $id
+   *   The entity ID.
    */
-  protected final static function isArrayNumeric(array $input) {
-    foreach (array_keys($input) as $key) {
-      if (!ctype_digit((string) $key)) {
-        return FALSE;
-      }
+  public function clearResourceRenderedCacheEntity($id) {
+    // Build the cache ID.
+    $version = $this->getVersion();
+    $cid = 'v' . $version['major'] . '.' . $version['minor'] . '::' . $this->getResourceName() . '::uu' . $this->getAccount()->uid . '::paet:';
+    $cid .= $this->getEntityType();
+    $cid .= '::ei:' . $id;
+    $this->cacheInvalidate($cid);
+  }
+
+  /**
+   * Get the entity ID based on the ID provided in the request.
+   *
+   * As any field may be used as the ID, we convert it to the numeric internal
+   * ID of the entity
+   *
+   * @param mixed $id
+   *   The provided ID.
+   *
+   * @throws RestfulBadRequestException
+   * @throws RestfulUnprocessableEntityException
+   *
+   * @return int
+   *   The entity ID.
+   */
+  protected function getEntityIdByFieldId($id) {
+    $request = $this->getRequest();
+    if (empty($request['loadByFieldName'])) {
+      // The regular entity ID was provided.
+      return $id;
     }
-    return TRUE;
+    $public_property_name = $request['loadByFieldName'];
+    // We need to get the internal field/property from the public name.
+    $public_fields = $this->getPublicFields();
+    if ((!$public_field_info = $public_fields[$public_property_name]) || empty($public_field_info['property'])) {
+      throw new \RestfulBadRequestException(format_string('Cannot load an entity using the field "@name"', array(
+        '@name' => $public_property_name,
+      )));
+    }
+    $query = $this->getEntityFieldQuery();
+    $query->range(0, 1);
+    // Find out if the provided ID is a Drupal field or an entity property.
+    if (static::propertyIsField($public_field_info['property'])) {
+      $query->fieldCondition($public_field_info['property'], $public_field_info['column'], $id);
+    }
+    else {
+      $query->propertyCondition($public_field_info['property'], $id);
+    }
+
+    // Execute the query and gather the results.
+    $result = $query->execute();
+    if (empty($result[$this->getEntityType()])) {
+      throw new RestfulUnprocessableEntityException(format_string('The entity ID @id by @name for @resource cannot be loaded.', array(
+        '@id' => $id,
+        '@resource' => $this->getPluginKey('label'),
+        '@name' => $public_property_name,
+      )));
+    }
+
+    // There is nothing that guarantees that there is only one result, since
+    // this is user input data. Return the first ID.
+    $entity_id = key($result[$this->getEntityType()]);
+
+    // REST requires a canonical URL for every resource.
+    $this->addHttpHeaders('Link', $this->versionedUrl($entity_id, array(), FALSE) . '; rel="canonical"');
+
+    return $entity_id;
+  }
+
+  /**
+   * Checks if a given string represents a Field API field.
+   *
+   * @param string $name
+   *   The name of the field/property.
+   *
+   * @return bool
+   *   TRUE if it's a field. FALSE otherwise.
+   */
+  public static function propertyIsField($name) {
+    $field_info = field_info_field($name);
+    return !empty($field_info);
   }
 
 }
